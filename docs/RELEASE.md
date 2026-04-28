@@ -23,11 +23,22 @@
    git push origin v0.1.0
    ```
 
-5. GitHub Actions will build the Windows x64 `.exe` and attach a zip to the
-   GitHub Release.
+5. Package and publish:
+
+   ```powershell
+   New-Item -ItemType Directory -Force dist | Out-Null
+   Copy-Item target/release/codex-savings-tray.exe dist/
+   Compress-Archive -Path dist/codex-savings-tray.exe -DestinationPath dist/codex-savings-tray-windows-x64.zip -Force
+   gh release create v0.1.0 dist/codex-savings-tray-windows-x64.zip --title "Codex Savings Tray v0.1.0" --notes-file dist/release-notes-v0.1.0.md --latest
+   ```
 
 ## Signing
 
 The current local build can be signed with a local development certificate, but
-public releases should use a real code-signing certificate. GitHub Actions does
-not sign the binary yet.
+public releases should use a real code-signing certificate.
+
+## CI Automation
+
+GitHub rejected workflow files from the local `gh` token because it lacks the
+`workflow` scope. After refreshing auth with that scope, add CI/release
+workflows and switch releases back to tag-triggered automation.

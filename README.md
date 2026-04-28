@@ -63,8 +63,8 @@ with the bundled SQLite feature.
 
 ## Release
 
-Create a tag such as `v0.1.0` and push it. GitHub Actions builds the Windows
-x64 release artifact and attaches it to the GitHub Release.
+Create a tag such as `v0.1.0`, build locally, zip the release `.exe`, and
+create a GitHub Release.
 
 See `docs/RELEASE.md` for the full checklist.
 
