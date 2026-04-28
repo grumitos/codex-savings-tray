@@ -1,7 +1,8 @@
 # Codex Savings Tray
 
 Tiny Windows tray app that estimates the API-equivalent value of local Codex
-usage and compares the month-to-date total with a USD 20 Plus plan.
+usage and compares the month-to-date total with your selected ChatGPT/Codex
+plan.
 
 It reads local Codex data only:
 
@@ -21,10 +22,31 @@ Run the release executable:
 Tray actions:
 
 - Left click: show or hide the compact view.
-- Right click: `Refresh`, `All-time total`, or `Exit`.
+- Right click: choose `Plan`, `Reload`, `Calculate total saved`, `Open config`,
+  `Open usage dashboard`, or `Exit`.
 - Background refresh: month-to-date only, every 5 minutes.
 - All-time total: scanned only when selected, so old history does not cost
   resources during normal use.
+
+Config lives at:
+
+```text
+%APPDATA%\Codex Savings Tracker\config.json
+```
+
+Supported config values:
+
+```json
+{
+  "plan": "plus",
+  "monthly_usd_override": null,
+  "language": "auto"
+}
+```
+
+`plan` can be `free`, `go`, `plus`, `pro_5x`, `pro_20x`, `business`,
+`enterprise_edu`, `api_key`, or `custom`. `language` can be `auto`, `en`, or
+`es`.
 
 Diagnostic CLI:
 

@@ -15,29 +15,41 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM},
+    Globalization::GetUserDefaultUILanguage,
     Graphics::Gdi::{
-        BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-        GetMonitorInfoW, GetStockObject, InvalidateRect, MonitorFromPoint, Rectangle, SelectObject,
-        SetBkMode, SetTextColor, DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-        DT_SINGLELINE, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+        BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
+        EndPaint, FillRect, FillRgn, FrameRgn, GetMonitorInfoW, GetStockObject, InvalidateRect,
+        MonitorFromPoint, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DEFAULT_GUI_FONT,
+        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, HDC, HRGN, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     },
     System::{LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime},
     UI::{
+        HiDpi::{
+            GetDpiForWindow, SetProcessDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        },
         Shell::{
-            Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-            NOTIFYICONDATAW,
+            ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+            NIM_MODIFY, NOTIFYICONDATAW,
         },
         WindowsAndMessaging::*,
     },
 };
 
-const PLAN_USD: f64 = 20.0;
 const WM_TRAYICON: u32 = WM_USER + 7;
 const TRAY_UID: u32 = 1;
 const TIMER_UID: usize = 1;
 const ID_REFRESH: usize = 1001;
 const ID_EXIT: usize = 1002;
 const ID_ALL_TIME: usize = 1003;
+const ID_OPEN_CONFIG: usize = 1004;
+const ID_OPEN_USAGE: usize = 1005;
+const ID_PLAN_BASE: usize = 1100;
+const POPUP_W: i32 = 336;
+const POPUP_H: i32 = 244;
+const POPUP_GAP: i32 = 28;
+const USAGE_URL: &str = "https://chatgpt.com/codex/cloud/settings/analytics";
 
 #[derive(Clone, Copy)]
 struct Price {
@@ -46,88 +58,94 @@ struct Price {
     output: f64,
 }
 
+const fn price(input: f64, cached: f64, output: f64) -> Price {
+    Price {
+        input,
+        cached,
+        output,
+    }
+}
+
+#[rustfmt::skip]
 const PRICES: &[(&str, Price)] = &[
-    (
-        "gpt-5.5",
-        Price {
-            input: 5.0,
-            cached: 0.5,
-            output: 30.0,
-        },
-    ),
-    (
-        "gpt-5.4-mini",
-        Price {
-            input: 0.75,
-            cached: 0.075,
-            output: 4.5,
-        },
-    ),
-    (
-        "gpt-5.4-nano",
-        Price {
-            input: 0.20,
-            cached: 0.02,
-            output: 1.25,
-        },
-    ),
-    (
-        "gpt-5.4",
-        Price {
-            input: 2.5,
-            cached: 0.25,
-            output: 15.0,
-        },
-    ),
-    (
-        "gpt-5.3-codex",
-        Price {
-            input: 1.75,
-            cached: 0.175,
-            output: 14.0,
-        },
-    ),
-    (
-        "gpt-5.2-codex",
-        Price {
-            input: 1.75,
-            cached: 0.175,
-            output: 14.0,
-        },
-    ),
-    (
-        "gpt-5.1-codex-max",
-        Price {
-            input: 1.25,
-            cached: 0.125,
-            output: 10.0,
-        },
-    ),
-    (
-        "gpt-5.1-codex",
-        Price {
-            input: 1.25,
-            cached: 0.125,
-            output: 10.0,
-        },
-    ),
-    (
-        "gpt-5.1",
-        Price {
-            input: 1.25,
-            cached: 0.125,
-            output: 10.0,
-        },
-    ),
-    (
-        "gpt-5",
-        Price {
-            input: 1.25,
-            cached: 0.125,
-            output: 10.0,
-        },
-    ),
+    ("gpt-5.5", price(5.0, 0.5, 30.0)),
+    ("gpt-5.4-mini", price(0.75, 0.075, 4.5)),
+    ("gpt-5.4-nano", price(0.20, 0.02, 1.25)),
+    ("gpt-5.4", price(2.5, 0.25, 15.0)),
+    ("gpt-5.3-codex", price(1.75, 0.175, 14.0)),
+    ("gpt-5.2-codex", price(1.75, 0.175, 14.0)),
+    ("gpt-5.1-codex-max", price(1.25, 0.125, 10.0)),
+    ("gpt-5.1-codex", price(1.25, 0.125, 10.0)),
+    ("gpt-5.1", price(1.25, 0.125, 10.0)),
+    ("gpt-5", price(1.25, 0.125, 10.0)),
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Lang {
+    En,
+    Es,
+}
+
+#[derive(Clone, Copy)]
+struct Plan {
+    id: &'static str,
+    en: &'static str,
+    es: &'static str,
+    usd: f64,
+    limits_en: &'static str,
+    limits_es: &'static str,
+}
+
+const fn plan(
+    id: &'static str,
+    en: &'static str,
+    es: &'static str,
+    usd: f64,
+    limits_en: &'static str,
+    limits_es: &'static str,
+) -> Plan {
+    Plan {
+        id,
+        en,
+        es,
+        usd,
+        limits_en,
+        limits_es,
+    }
+}
+
+#[rustfmt::skip]
+const PLANS: &[Plan] = &[
+    plan("free", "Free", "Gratis", 0.0, "Quick tasks; see dashboard", "Tareas rapidas; ver panel"),
+    plan("go", "Go", "Go", 8.0, "Lightweight tasks; see dashboard", "Tareas ligeras; ver panel"),
+    plan("plus", "Plus", "Plus", 20.0, "5h local: 5.5 15-80, 5.4 20-100", "5h local: 5.5 15-80, 5.4 20-100"),
+    plan("pro_5x", "Pro 5x", "Pro 5x", 100.0, "5h local: 5.5 80-400, 5.4 100-500", "5h local: 5.5 80-400, 5.4 100-500"),
+    plan("pro_20x", "Pro 20x", "Pro 20x", 200.0, "5h local: 5.5 300-1600, 5.4 400-2000", "5h local: 5.5 300-1600, 5.4 400-2000"),
+    plan("business", "Business", "Business", 0.0, "Pay as you go; seats often match Plus", "Pago por uso; asientos suelen igualar Plus"),
+    plan("enterprise_edu", "Enterprise/Edu", "Enterprise/Edu", 0.0, "Credits or Plus-like seats", "Creditos o asientos tipo Plus"),
+    plan("api_key", "API Key", "Clave API", 0.0, "Usage-based API pricing", "Precio API por uso"),
+    plan("custom", "Custom", "Personalizado", 0.0, "Manual monthly amount", "Monto mensual manual"),
+];
+
+const CREDIT_RATES: &str =
+    "Credits/1M tokens: 5.5 125/12.5/750; 5.4 62.5/6.25/375; mini 18.75/1.875/113";
+
+#[derive(Clone)]
+struct Config {
+    plan: String,
+    monthly_usd_override: Option<f64>,
+    language: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            plan: "plus".to_string(),
+            monthly_usd_override: None,
+            language: "auto".to_string(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct Usage {
@@ -184,6 +202,7 @@ struct Snapshot {
     month: Period,
     today: Period,
     all_time: Option<Period>,
+    config: Config,
     updated: String,
     all_time_updated: String,
     codex_home: PathBuf,
@@ -198,6 +217,7 @@ impl Default for Snapshot {
             month: Period::default(),
             today: Period::default(),
             all_time: None,
+            config: Config::default(),
             updated: String::new(),
             all_time_updated: String::new(),
             codex_home: codex_home(),
@@ -209,6 +229,12 @@ impl Default for Snapshot {
 }
 
 static SNAPSHOT: OnceLock<Mutex<Snapshot>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct Ui {
+    hdc: HDC,
+    dpi: i32,
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -224,16 +250,24 @@ fn print_once(include_all_time: bool) {
         error: Some(error),
         ..Snapshot::default()
     });
+    snap.config = load_config();
     if include_all_time {
         calculate_all_time(&mut snap);
     }
+    let plan = current_plan(&snap.config);
+    let plan_usd = plan_usd(&snap.config);
     println!("Codex savings tray");
     println!("Home: {}", snap.codex_home.display());
-    println!(
-        "Month: {} ({:.0}% of Plus)",
-        money(snap.month.cost),
-        snap.month.cost / PLAN_USD * 100.0
-    );
+    println!("Plan: {} ({}/month)", plan.en, money(plan_usd));
+    if plan_usd > 0.0 {
+        println!(
+            "Month: {} ({:.0}% of plan)",
+            money(snap.month.cost),
+            snap.month.cost / plan_usd * 100.0
+        );
+    } else {
+        println!("Month: {}", money(snap.month.cost));
+    }
     println!("Today: {}", money(snap.today.cost));
     if let Some(all_time) = snap.all_time {
         println!("All-time: {}", money(all_time.cost));
@@ -244,12 +278,11 @@ fn print_once(include_all_time: bool) {
         snap.month.calls,
         snap.month.sessions
     );
-    if snap.assumed_models > 0 {
-        println!("Assumed model for {} session(s)", snap.assumed_models);
-    }
     if !snap.unknown_models.is_empty() {
         println!("Unknown price models: {}", snap.unknown_models.join(", "));
     }
+    println!("Limits: {}", plan.limits_en);
+    println!("{CREDIT_RATES}");
     if let Some(error) = snap.error {
         println!("Error: {error}");
     }
@@ -502,6 +535,7 @@ fn local_time() -> SYSTEMTIME {
 }
 
 unsafe fn run_tray() {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     SNAPSHOT.set(Mutex::new(Snapshot::default())).ok();
     let instance = GetModuleHandleW(null());
     let class = wide("CodexSavingsTray");
@@ -510,7 +544,8 @@ unsafe fn run_tray() {
         hInstance: instance,
         lpszClassName: class.as_ptr(),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        style: CS_HREDRAW | CS_VREDRAW,
+        hIcon: app_icon(),
+        style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
         ..zeroed()
     };
     RegisterClassW(&wc);
@@ -519,11 +554,11 @@ unsafe fn run_tray() {
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         class.as_ptr(),
         wide("Codex Savings").as_ptr(),
-        WS_POPUP | WS_BORDER,
+        WS_POPUP,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        336,
-        218,
+        POPUP_W,
+        POPUP_H,
         null_mut(),
         null_mut(),
         instance,
@@ -560,13 +595,21 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_COMMAND => {
-            match wparam & 0xffff {
-                ID_REFRESH => refresh(hwnd),
-                ID_ALL_TIME => refresh_all_time(hwnd),
-                ID_EXIT => {
-                    DestroyWindow(hwnd);
+            let id = wparam & 0xffff;
+            if (ID_PLAN_BASE..ID_PLAN_BASE + PLANS.len()).contains(&id) {
+                set_plan(PLANS[id - ID_PLAN_BASE].id);
+                refresh(hwnd);
+            } else {
+                match id {
+                    ID_REFRESH => refresh(hwnd),
+                    ID_ALL_TIME => refresh_all_time(hwnd),
+                    ID_OPEN_CONFIG => open_config(hwnd),
+                    ID_OPEN_USAGE => open_url(hwnd, USAGE_URL),
+                    ID_EXIT => {
+                        DestroyWindow(hwnd);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             0
         }
@@ -576,6 +619,21 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_PAINT => {
             paint(hwnd);
+            0
+        }
+        WM_DPICHANGED => {
+            let rect = &*(lparam as *const RECT);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            shape_window(hwnd, rect.right - rect.left, rect.bottom - rect.top);
+            InvalidateRect(hwnd, null(), 1);
             0
         }
         WM_ACTIVATE => {
@@ -604,6 +662,7 @@ unsafe fn refresh(hwnd: HWND) {
         error: Some(error),
         ..Snapshot::default()
     });
+    snap.config = load_config();
     if let Some((all_time, updated)) = old_all_time {
         snap.all_time = all_time;
         snap.all_time_updated = updated;
@@ -632,14 +691,33 @@ unsafe fn tray_icon(hwnd: HWND, action: u32) {
     data.uID = TRAY_UID;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_TRAYICON;
-    data.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    data.hIcon = app_icon();
 
     let tip = SNAPSHOT
         .get()
         .and_then(|s| {
-            s.lock()
-                .ok()
-                .map(|s| format!("Codex: {} this month", money(s.month.cost)))
+            s.lock().ok().map(|s| {
+                let lang = current_lang(&s.config);
+                let plan = current_plan(&s.config);
+                let plan_usd = plan_usd(&s.config);
+                let mut tip = format!(
+                    "Codex {}: {} {}",
+                    plan_name(plan, lang),
+                    money(s.month.cost),
+                    t(lang, "this month", "este mes")
+                );
+                if plan_usd > 0.0 {
+                    tip.push_str(&format!(
+                        " ({:.0}% {})",
+                        s.month.cost / plan_usd * 100.0,
+                        plan_name(plan, lang)
+                    ));
+                }
+                if let Some(all_time) = &s.all_time {
+                    tip.push_str(&format!("; total {}", money(all_time.cost)));
+                }
+                truncate_chars(&tip, 126)
+            })
         })
         .unwrap_or_else(|| "Codex savings".to_string());
     copy_wide(&tip, &mut data.szTip);
@@ -659,25 +737,80 @@ unsafe fn toggle_popup(hwnd: HWND) {
         ..zeroed()
     };
     GetMonitorInfoW(monitor, &mut info);
-    let w = 336;
-    let h = 218;
-    let x = (pt.x - w + 20).clamp(info.rcWork.left, info.rcWork.right - w);
-    let y = (pt.y - h - 12).clamp(info.rcWork.top, info.rcWork.bottom - h);
+    let w = scale(hwnd, POPUP_W);
+    let h = scale(hwnd, POPUP_H);
+    let x = (pt.x - w + scale(hwnd, 20)).clamp(info.rcWork.left, info.rcWork.right - w);
+    let y = (pt.y - h - scale(hwnd, POPUP_GAP)).clamp(info.rcWork.top, info.rcWork.bottom - h);
+    shape_window(hwnd, w, h);
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
     SetForegroundWindow(hwnd);
 }
 
+unsafe fn shape_window(hwnd: HWND, w: i32, h: i32) {
+    let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, scale(hwnd, 24), scale(hwnd, 24));
+    if SetWindowRgn(hwnd, region, 1) == 0 {
+        DeleteObject(region);
+    }
+}
+
 unsafe fn show_menu(hwnd: HWND) {
+    let config = SNAPSHOT
+        .get()
+        .and_then(|s| s.lock().ok().map(|s| s.config.clone()))
+        .unwrap_or_else(load_config);
+    let lang = current_lang(&config);
     let menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, ID_REFRESH, wide("Refresh").as_ptr());
+    let plans = CreatePopupMenu();
+    for (index, plan) in PLANS.iter().enumerate() {
+        let checked = if plan.id == config.plan {
+            MF_CHECKED
+        } else {
+            0
+        };
+        AppendMenuW(
+            plans,
+            MF_STRING | checked,
+            ID_PLAN_BASE + index,
+            wide(&plan_menu_label(plan, lang)).as_ptr(),
+        );
+    }
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        plans as usize,
+        wide(t(lang, "Plan", "Plan")).as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_REFRESH,
+        wide(t(lang, "Reload", "Recargar")).as_ptr(),
+    );
     AppendMenuW(
         menu,
         MF_STRING,
         ID_ALL_TIME,
-        wide("All-time total").as_ptr(),
+        wide(t(lang, "Calculate total saved", "Calcular ahorro total")).as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_OPEN_CONFIG,
+        wide(t(lang, "Open config", "Abrir config")).as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_OPEN_USAGE,
+        wide(t(lang, "Open usage dashboard", "Abrir panel de uso")).as_ptr(),
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
-    AppendMenuW(menu, MF_STRING, ID_EXIT, wide("Exit").as_ptr());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_EXIT,
+        wide(t(lang, "Exit", "Salir")).as_ptr(),
+    );
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
@@ -690,121 +823,125 @@ unsafe fn paint(hwnd: HWND) {
         .get()
         .and_then(|s| s.lock().ok().map(|s| s.clone()))
         .unwrap_or_default();
+    let dpi = dpi(hwnd);
+    let lang = current_lang(&snap.config);
+    let plan = current_plan(&snap.config);
+    let plan_usd = plan_usd(&snap.config);
     let mut ps = zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
+    let ui = Ui { hdc, dpi };
     let mut rect = zeroed();
     GetClientRect(hwnd, &mut rect);
 
     fill(hdc, rect, rgb(248, 249, 247));
+    round_frame(ui, [0, 0, POPUP_W, POPUP_H], 12, rgb(196, 201, 196));
     SetBkMode(hdc, TRANSPARENT as i32);
     SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
 
-    draw(hdc, "Codex savings", 18, 14, 300, 20, rgb(61, 67, 73));
+    draw(ui, "Codex", [18, 16, 300, 20], rgb(61, 67, 73));
     let headline = money(snap.month.cost);
-    draw_big(hdc, &headline, 18, 42, 180, 42, rgb(23, 28, 32));
+    draw_big(ui, &headline, [18, 46, 180, 42], rgb(23, 28, 32));
     draw(
-        hdc,
-        "month API equivalent",
-        18,
-        84,
-        180,
-        20,
+        ui,
+        t(
+            lang,
+            "API value used this month",
+            "valor API usado este mes",
+        ),
+        [18, 88, 220, 20],
         rgb(95, 104, 111),
     );
 
-    let pct = if PLAN_USD > 0.0 {
-        snap.month.cost / PLAN_USD
+    let pct = if plan_usd > 0.0 {
+        snap.month.cost / plan_usd
     } else {
         0.0
     };
-    draw_right(
-        hdc,
-        &format!("{:.0}%", pct * 100.0),
-        230,
-        50,
-        82,
-        24,
-        rgb(23, 28, 32),
-    );
-    progress(hdc, 18, 112, 294, 10, pct);
+    if plan_usd > 0.0 {
+        let pct_label = if pct > 1.0 {
+            format!("+{:.0}%", (pct - 1.0) * 100.0)
+        } else {
+            format!("{:.0}%", pct * 100.0)
+        };
+        draw_right(ui, &pct_label, [230, 54, 82, 24], rgb(23, 28, 32));
+    }
+    progress(ui, [18, 118, 294, 8], pct);
 
-    let net = snap.month.cost - PLAN_USD;
-    let net_label = if net >= 0.0 { "over Plus" } else { "to Plus" };
-    draw(
-        hdc,
-        &format!("{} {}", money(net.abs()), net_label),
-        18,
-        132,
-        140,
-        20,
-        rgb(61, 67, 73),
-    );
+    let plan_line = if plan_usd > 0.0 && snap.month.cost > plan_usd {
+        format!(
+            "{} {} (+{:.0}%)",
+            money(snap.month.cost - plan_usd),
+            t(lang, "over", "adicional"),
+            (pct - 1.0) * 100.0
+        )
+    } else if plan_usd > 0.0 {
+        format!("{:.0}% {}", pct * 100.0, t(lang, "of plan", "del plan"))
+    } else {
+        plan_limit(plan, lang).to_string()
+    };
+    draw(ui, &plan_line, [18, 138, 170, 20], rgb(61, 67, 73));
     draw_right(
-        hdc,
-        &format!("today {}", money(snap.today.cost)),
-        170,
-        132,
-        142,
-        20,
+        ui,
+        &format!("{} {}", t(lang, "today", "hoy"), money(snap.today.cost)),
+        [190, 138, 122, 20],
         rgb(61, 67, 73),
     );
 
+    let has_total = snap.all_time.is_some();
     if let Some(all_time) = snap.all_time {
         draw(
-            hdc,
-            &format!("all-time {}", money(all_time.cost)),
-            18,
-            148,
-            160,
-            18,
-            rgb(61, 67, 73),
+            ui,
+            t(lang, "total", "total"),
+            [18, 160, 42, 18],
+            rgb(95, 104, 111),
+        );
+        draw_medium(
+            ui,
+            &money(all_time.cost),
+            [58, 154, 122, 26],
+            rgb(23, 28, 32),
         );
         draw_right(
-            hdc,
-            &format!("at {}", snap.all_time_updated),
-            190,
-            148,
-            122,
-            18,
+            ui,
+            &snap.all_time_updated,
+            [190, 160, 122, 18],
             rgb(123, 130, 136),
         );
     }
+    let (metrics_y, status_y) = if has_total { (186, 216) } else { (166, 216) };
 
     draw(
-        hdc,
+        ui,
         &format!("{} tokens", compact(snap.month.usage.total)),
-        18,
-        164,
-        96,
-        20,
+        [18, metrics_y, 96, 20],
         rgb(95, 104, 111),
     );
     draw(
-        hdc,
-        &format!("{} calls", snap.month.calls),
-        124,
-        164,
-        76,
-        20,
+        ui,
+        &format!("{} {}", snap.month.calls, t(lang, "calls", "llamadas")),
+        [124, metrics_y, 76, 20],
         rgb(95, 104, 111),
     );
     draw(
-        hdc,
-        &format!("{} sessions", snap.month.sessions),
-        208,
-        164,
-        104,
-        20,
+        ui,
+        &format!(
+            "{} {}",
+            snap.month.sessions,
+            t(lang, "sessions", "sesiones")
+        ),
+        [208, metrics_y, 104, 20],
         rgb(95, 104, 111),
     );
 
-    let status = snap
-        .error
-        .clone()
-        .or_else(|| (!snap.unknown_models.is_empty()).then(|| "unknown model price".to_string()))
-        .or_else(|| (snap.assumed_models > 0).then(|| "using fallback model".to_string()))
-        .unwrap_or_else(|| format!("updated {}", snap.updated));
-    draw(hdc, &status, 18, 190, 294, 18, rgb(123, 130, 136));
+    let status = snap.error.clone().unwrap_or_else(|| {
+        format!(
+            "{} - {} {}",
+            plan_name(plan, lang),
+            t(lang, "updated", "actualizado"),
+            snap.updated
+        )
+    });
+    draw(ui, &status, [18, status_y, 294, 18], rgb(123, 130, 136));
 
     EndPaint(hwnd, &ps);
 }
@@ -815,26 +952,48 @@ unsafe fn fill(hdc: HDC, rect: RECT, color: COLORREF) {
     DeleteObject(brush);
 }
 
-unsafe fn progress(hdc: HDC, x: i32, y: i32, w: i32, h: i32, pct: f64) {
-    let track = RECT {
-        left: x,
-        top: y,
-        right: x + w,
-        bottom: y + h,
-    };
-    fill(hdc, track, rgb(225, 229, 225));
-    let fill_w = ((w as f64 * pct.min(1.0)).round() as i32).max(2);
-    let bar = RECT {
-        right: x + fill_w,
-        ..track
-    };
-    fill(hdc, bar, rgb(44, 129, 103));
-    Rectangle(hdc, x, y, x + w, y + h);
+unsafe fn progress(ui: Ui, rect: [i32; 4], pct: f64) {
+    let [x, y, w, h] = rect;
+    round_fill(ui, rect, 6, rgb(225, 229, 225));
+    let fill_w = (w as f64 * pct.clamp(0.0, 1.0)).round() as i32;
+    if fill_w > 0 {
+        let color = if pct > 1.0 {
+            rgb(177, 89, 73)
+        } else {
+            rgb(44, 129, 103)
+        };
+        round_fill(ui, [x, y, fill_w, h], 6, color);
+    }
 }
 
-unsafe fn draw(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32, color: COLORREF) {
+unsafe fn round_fill(ui: Ui, rect: [i32; 4], radius: i32, color: COLORREF) {
+    let [x, y, w, h] = rect.map(|v| z(ui.dpi, v));
+    let region = round_region(ui, [x, y, w, h], radius);
+    let brush = CreateSolidBrush(color);
+    FillRgn(ui.hdc, region, brush);
+    DeleteObject(brush);
+    DeleteObject(region);
+}
+
+unsafe fn round_frame(ui: Ui, rect: [i32; 4], radius: i32, color: COLORREF) {
+    let [x, y, w, h] = rect.map(|v| z(ui.dpi, v));
+    let region = round_region(ui, [x, y, w, h], radius);
+    let brush = CreateSolidBrush(color);
+    FrameRgn(ui.hdc, region, brush, z(ui.dpi, 1), z(ui.dpi, 1));
+    DeleteObject(brush);
+    DeleteObject(region);
+}
+
+unsafe fn round_region(ui: Ui, rect: [i32; 4], radius: i32) -> HRGN {
+    let [x, y, w, h] = rect;
+    let r = z(ui.dpi, radius * 2);
+    CreateRoundRectRgn(x, y, x + w, y + h, r, r)
+}
+
+unsafe fn draw(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
+    let [x, y, w, h] = rect;
     draw_text(
-        hdc,
+        ui,
         text,
         RECT {
             left: x,
@@ -847,9 +1006,10 @@ unsafe fn draw(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32, color: COLO
     );
 }
 
-unsafe fn draw_right(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32, color: COLORREF) {
+unsafe fn draw_right(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
+    let [x, y, w, h] = rect;
     draw_text(
-        hdc,
+        ui,
         text,
         RECT {
             left: x,
@@ -862,12 +1022,37 @@ unsafe fn draw_right(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32, color
     );
 }
 
-unsafe fn draw_big(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32, color: COLORREF) {
+unsafe fn draw_big(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
+    draw_font(ui, text, rect, color, 30, 600);
+}
+
+unsafe fn draw_medium(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
+    draw_font(ui, text, rect, color, 17, 600);
+}
+
+unsafe fn draw_font(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF, size: i32, weight: i32) {
+    let [x, y, w, h] = rect;
+    let (hdc, dpi) = (ui.hdc, ui.dpi);
     let name = wide("Segoe UI");
-    let font = CreateFontW(-30, 0, 0, 0, 600, 0, 0, 0, 0, 0, 0, 5, 0, name.as_ptr());
+    let font = CreateFontW(
+        -z(dpi, size),
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        5,
+        0,
+        name.as_ptr(),
+    );
     let old = SelectObject(hdc, font);
     draw_text(
-        hdc,
+        ui,
         text,
         RECT {
             left: x,
@@ -882,11 +1067,15 @@ unsafe fn draw_big(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32, color: 
     DeleteObject(font);
 }
 
-unsafe fn draw_text(hdc: HDC, text: &str, mut rect: RECT, color: COLORREF, align: u32) {
+unsafe fn draw_text(ui: Ui, text: &str, mut rect: RECT, color: COLORREF, align: u32) {
+    rect.left = z(ui.dpi, rect.left);
+    rect.top = z(ui.dpi, rect.top);
+    rect.right = z(ui.dpi, rect.right);
+    rect.bottom = z(ui.dpi, rect.bottom);
     let text = wide(text);
-    SetTextColor(hdc, color);
+    SetTextColor(ui.hdc, color);
     DrawTextW(
-        hdc,
+        ui.hdc,
         text.as_ptr(),
         -1,
         &mut rect,
@@ -923,6 +1112,194 @@ fn copy_wide<const N: usize>(value: &str, target: &mut [u16; N]) {
     if len == N {
         target[N - 1] = 0;
     }
+}
+
+fn load_config() -> Config {
+    let path = config_path();
+    if !path.exists() {
+        write_config(&Config::default());
+    }
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(config_from_json)
+        .unwrap_or_default()
+}
+
+fn config_from_json(value: Value) -> Config {
+    let default = Config::default();
+    let plan = value
+        .get("plan")
+        .and_then(Value::as_str)
+        .filter(|id| plan_by_id(id).is_some())
+        .unwrap_or(&default.plan)
+        .to_string();
+    let language = value
+        .get("language")
+        .and_then(Value::as_str)
+        .filter(|lang| matches!(*lang, "auto" | "en" | "es"))
+        .unwrap_or(&default.language)
+        .to_string();
+    let monthly_usd_override = value
+        .get("monthly_usd_override")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    Config {
+        plan,
+        monthly_usd_override,
+        language,
+    }
+}
+
+fn write_config(config: &Config) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let monthly = config
+        .monthly_usd_override
+        .and_then(serde_json::Number::from_f64)
+        .map(Value::Number)
+        .unwrap_or(Value::Null);
+    let text = serde_json::json!({
+        "plan": config.plan.clone(),
+        "monthly_usd_override": monthly,
+        "language": config.language.clone(),
+    });
+    let _ = fs::write(
+        path,
+        serde_json::to_string_pretty(&text).unwrap_or_default(),
+    );
+}
+
+fn config_path() -> PathBuf {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Codex Savings Tracker")
+        .join("config.json")
+}
+
+fn set_plan(id: &str) {
+    if plan_by_id(id).is_none() {
+        return;
+    }
+    let mut config = load_config();
+    config.plan = id.to_string();
+    config.monthly_usd_override = None;
+    write_config(&config);
+}
+
+fn plan_by_id(id: &str) -> Option<&'static Plan> {
+    PLANS.iter().find(|plan| plan.id == id)
+}
+
+fn current_plan(config: &Config) -> &'static Plan {
+    plan_by_id(&config.plan).unwrap_or(&PLANS[2])
+}
+
+fn plan_usd(config: &Config) -> f64 {
+    config
+        .monthly_usd_override
+        .unwrap_or_else(|| current_plan(config).usd)
+}
+
+fn current_lang(config: &Config) -> Lang {
+    match config.language.as_str() {
+        "en" => Lang::En,
+        "es" => Lang::Es,
+        _ => {
+            let primary = unsafe { GetUserDefaultUILanguage() } & 0x03ff;
+            if primary == 0x000a {
+                Lang::Es
+            } else {
+                Lang::En
+            }
+        }
+    }
+}
+
+fn plan_name(plan: &Plan, lang: Lang) -> &'static str {
+    t(lang, plan.en, plan.es)
+}
+
+fn plan_limit(plan: &Plan, lang: Lang) -> &'static str {
+    t(lang, plan.limits_en, plan.limits_es)
+}
+
+fn plan_menu_label(plan: &Plan, lang: Lang) -> String {
+    if plan.usd > 0.0 {
+        format!("{} ({}/mo)", plan_name(plan, lang), money(plan.usd))
+    } else {
+        plan_name(plan, lang).to_string()
+    }
+}
+
+fn t(lang: Lang, en: &'static str, es: &'static str) -> &'static str {
+    if lang == Lang::Es {
+        es
+    } else {
+        en
+    }
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max) {
+        out.push(ch);
+    }
+    out
+}
+
+fn z(dpi: i32, value: i32) -> i32 {
+    (value * dpi + 48) / 96
+}
+
+fn dpi(hwnd: HWND) -> i32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        96
+    } else {
+        dpi as i32
+    }
+}
+
+fn scale(hwnd: HWND, value: i32) -> i32 {
+    z(dpi(hwnd), value)
+}
+
+unsafe fn app_icon() -> HICON {
+    let icon = LoadImageW(
+        GetModuleHandleW(null()),
+        std::ptr::without_provenance::<u16>(1),
+        IMAGE_ICON,
+        0,
+        0,
+        LR_DEFAULTSIZE | LR_SHARED,
+    ) as HICON;
+    if icon.is_null() {
+        LoadIconW(null_mut(), IDI_APPLICATION)
+    } else {
+        icon
+    }
+}
+
+unsafe fn open_config(hwnd: HWND) {
+    let _ = load_config();
+    let path = config_path().to_string_lossy().to_string();
+    open_url(hwnd, &path);
+}
+
+unsafe fn open_url(hwnd: HWND, target: &str) {
+    ShellExecuteW(
+        hwnd,
+        wide("open").as_ptr(),
+        wide(target).as_ptr(),
+        null(),
+        null(),
+        SW_SHOWNORMAL,
+    );
 }
 
 #[cfg(test)]
@@ -1031,5 +1408,49 @@ mod tests {
         assert_eq!(period.usage.input, 108);
         assert_eq!(period.usage.output, 12);
         assert_eq!(period.usage.total, 120);
+    }
+
+    #[test]
+    fn config_parses_plan_override_and_language() {
+        let config = config_from_json(serde_json::json!({
+            "plan": "pro_20x",
+            "monthly_usd_override": 199.0,
+            "language": "es"
+        }));
+        assert_eq!(current_plan(&config).id, "pro_20x");
+        assert_eq!(plan_usd(&config), 199.0);
+        assert_eq!(current_lang(&config), Lang::Es);
+    }
+
+    #[test]
+    fn config_rejects_unknown_values() {
+        let config = config_from_json(serde_json::json!({
+            "plan": "unknown",
+            "monthly_usd_override": -1.0,
+            "language": "fr"
+        }));
+        assert_eq!(current_plan(&config).id, "plus");
+        assert_eq!(plan_usd(&config), 20.0);
+        assert_eq!(config.language, "auto");
+    }
+
+    #[test]
+    fn official_plan_ranges_are_available_locally() {
+        let plus = plan_by_id("plus").unwrap();
+        let pro = plan_by_id("pro_20x").unwrap();
+        assert!(plus.limits_en.contains("15-80"));
+        assert!(pro.limits_en.contains("300-1600"));
+        assert!(CREDIT_RATES.contains("125/12.5/750"));
+    }
+
+    #[test]
+    fn tooltip_truncation_keeps_char_boundary() {
+        assert_eq!(truncate_chars("abcdef", 3), "abc");
+        assert_eq!(truncate_chars("ahorro", 20), "ahorro");
+    }
+
+    #[test]
+    fn all_time_is_on_demand_by_default() {
+        assert!(Snapshot::default().all_time.is_none());
     }
 }
