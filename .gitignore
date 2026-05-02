@@ -1,3 +1,5 @@
 /target/
+/target-check/
+/target-verify/
 /dist/
 codex-savings-current.csv

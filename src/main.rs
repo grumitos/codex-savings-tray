@@ -3,27 +3,53 @@
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::{
-    cmp::Ordering,
+    cmp::Ordering as CmpOrdering,
     collections::{HashMap, HashSet},
     env,
+    ffi::c_void,
     fs::{self, File},
     io::{BufRead, BufReader},
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::{Mutex, OnceLock},
+    slice,
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Mutex, OnceLock,
+    },
 };
 use windows_sys::Win32::{
-    Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM},
+    Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM},
     Globalization::GetUserDefaultUILanguage,
-    Graphics::Gdi::{
-        BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-        EndPaint, FillRect, FillRgn, FrameRgn, GetMonitorInfoW, GetStockObject, InvalidateRect,
-        MonitorFromPoint, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DEFAULT_GUI_FONT,
-        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, HDC, HRGN, MONITORINFO,
-        MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+    Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     },
-    System::{LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime},
+    Graphics::Gdi::{
+        BeginPaint, CreateBitmap, CreateDIBSection, CreateFontW, CreateRoundRectRgn,
+        CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FillRgn, GetMonitorInfoW,
+        GetStockObject, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, SelectObject,
+        SetBkMode, SetTextColor, SetWindowRgn, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+        DT_RIGHT, DT_SINGLELINE, HBITMAP, HDC, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        TRANSPARENT,
+    },
+    Graphics::GdiPlus::{
+        CompositingModeSourceOver, CompositingQualityHighQuality, DashCapFlat, FillModeWinding,
+        GdipAddPathArc, GdipAddPathLine, GdipBitmapGetPixel, GdipClosePathFigure,
+        GdipCreateBitmapFromHICON, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1,
+        GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
+        GdipDisposeImage, GdipDrawArc, GdipDrawPath, GdipFillPath, GdipSetCompositingMode,
+        GdipSetCompositingQuality, GdipSetPenLineCap197819, GdipSetPixelOffsetMode,
+        GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap,
+        GpBrush, GpGraphics, GpImage, GpPath, GpPen, GpSolidFill, LineCapRound, Ok as GdipOk,
+        PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitPixel,
+    },
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+        SystemInformation::GetLocalTime,
+    },
     UI::{
         HiDpi::{
             GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -45,10 +71,20 @@ const ID_EXIT: usize = 1002;
 const ID_ALL_TIME: usize = 1003;
 const ID_OPEN_CONFIG: usize = 1004;
 const ID_OPEN_USAGE: usize = 1005;
+const ID_CYCLE_DAY: usize = 1006;
 const ID_PLAN_BASE: usize = 1100;
-const POPUP_W: i32 = 336;
-const POPUP_H: i32 = 244;
-const POPUP_GAP: i32 = 28;
+const VK_ESCAPE_CODE: u32 = 0x1b;
+const VK_RETURN_CODE: u32 = 0x0d;
+const POPUP_W: i32 = 392;
+const POPUP_H: i32 = 226;
+const POPUP_GAP: i32 = 12;
+const CONTENT_PAD: i32 = 24;
+const DIALOG_W: i32 = 330;
+const DIALOG_H: i32 = 388;
+const WINDOW_RADIUS: i32 = 16;
+const CONTROL_RADIUS: i32 = 7;
+const DWM_COLOR_NONE: COLORREF = 0xffff_fffe;
+const DWM_WINDOW_CORNER_DONOTROUND: i32 = 1;
 const USAGE_URL: &str = "https://chatgpt.com/codex/cloud/settings/analytics";
 
 #[derive(Clone, Copy)]
@@ -135,6 +171,7 @@ struct Config {
     plan: String,
     monthly_usd_override: Option<f64>,
     language: String,
+    cycle_day: u16,
 }
 
 impl Default for Config {
@@ -143,8 +180,16 @@ impl Default for Config {
             plan: "plus".to_string(),
             monthly_usd_override: None,
             language: "auto".to_string(),
+            cycle_day: 1,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+struct DateKey {
+    year: u16,
+    month: u16,
+    day: u16,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -206,6 +251,9 @@ struct Snapshot {
     updated: String,
     all_time_updated: String,
     codex_home: PathBuf,
+    cycle_start: DateKey,
+    cycle_next: DateKey,
+    cycle_days_left: i32,
     unknown_models: Vec<String>,
     assumed_models: u32,
     error: Option<String>,
@@ -221,6 +269,9 @@ impl Default for Snapshot {
             updated: String::new(),
             all_time_updated: String::new(),
             codex_home: codex_home(),
+            cycle_start: DateKey::default(),
+            cycle_next: DateKey::default(),
+            cycle_days_left: 0,
             unknown_models: vec![],
             assumed_models: 0,
             error: None,
@@ -229,11 +280,59 @@ impl Default for Snapshot {
 }
 
 static SNAPSHOT: OnceLock<Mutex<Snapshot>> = OnceLock::new();
+static CYCLE_DIALOG_DAY: AtomicU16 = AtomicU16::new(1);
 
 #[derive(Clone, Copy)]
 struct Ui {
     hdc: HDC,
     dpi: i32,
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    dark: bool,
+    bg: u32,
+    card: u32,
+    card_alt: u32,
+    border_argb: u32,
+    text: COLORREF,
+    muted: COLORREF,
+    subtle: COLORREF,
+    track: COLORREF,
+    accent_argb: u32,
+    danger: COLORREF,
+}
+
+fn system_theme() -> Theme {
+    if windows_apps_dark() {
+        Theme {
+            dark: true,
+            bg: argb(255, 28, 33, 43),
+            card: argb(255, 35, 41, 53),
+            card_alt: argb(255, 42, 49, 63),
+            border_argb: argb(118, 95, 106, 128),
+            text: rgb(243, 246, 250),
+            muted: rgb(190, 198, 210),
+            subtle: rgb(137, 149, 166),
+            track: rgb(52, 61, 78),
+            accent_argb: argb(255, 75, 119, 255),
+            danger: rgb(231, 121, 99),
+        }
+    } else {
+        Theme {
+            dark: false,
+            bg: argb(255, 246, 250, 255),
+            card: argb(255, 255, 255, 255),
+            card_alt: argb(255, 236, 242, 252),
+            border_argb: argb(150, 194, 205, 219),
+            text: rgb(19, 24, 33),
+            muted: rgb(82, 91, 106),
+            subtle: rgb(118, 129, 145),
+            track: rgb(218, 226, 236),
+            accent_argb: argb(255, 74, 112, 245),
+            danger: rgb(190, 91, 76),
+        }
+    }
 }
 
 fn main() {
@@ -246,11 +345,12 @@ fn main() {
 }
 
 fn print_once(include_all_time: bool) {
-    let mut snap = scan_month().unwrap_or_else(|error| Snapshot {
+    let config = load_config();
+    let mut snap = scan_month(&config).unwrap_or_else(|error| Snapshot {
         error: Some(error),
+        config: config.clone(),
         ..Snapshot::default()
     });
-    snap.config = load_config();
     if include_all_time {
         calculate_all_time(&mut snap);
     }
@@ -259,6 +359,12 @@ fn print_once(include_all_time: bool) {
     println!("Codex savings tray");
     println!("Home: {}", snap.codex_home.display());
     println!("Plan: {} ({}/month)", plan.en, money(plan_usd));
+    println!(
+        "Plan cycle: day {} (current starts {}, next reset {})",
+        snap.config.cycle_day,
+        format_date(snap.cycle_start),
+        format_date(snap.cycle_next)
+    );
     if plan_usd > 0.0 {
         println!(
             "Month: {} ({:.0}% of plan)",
@@ -288,40 +394,51 @@ fn print_once(include_all_time: bool) {
     }
 }
 
-fn scan_month() -> Result<Snapshot, String> {
+fn scan_month(config: &Config) -> Result<Snapshot, String> {
     let home = codex_home();
     let now = local_time();
+    let today = date_from_system(now);
+    let cycle_start = current_cycle_start(today, config.cycle_day);
+    let cycle_next = next_cycle_start(today, config.cycle_day);
     let metadata = load_metadata(&home);
-    let month_dir = home
-        .join("sessions")
-        .join(format!("{:04}", now.wYear))
-        .join(format!("{:02}", now.wMonth));
     let mut snap = Snapshot {
         updated: format!("{:02}:{:02}", now.wHour, now.wMinute),
         codex_home: home,
+        config: config.clone(),
+        cycle_start,
+        cycle_next,
+        cycle_days_left: days_between(today, cycle_next).max(0),
         ..Snapshot::default()
     };
 
-    if !month_dir.exists() {
-        return Ok(snap);
-    }
-
     let mut unknown = HashSet::new();
-    for path in jsonl_files(&month_dir) {
-        let key = path_key(&path);
-        let model = metadata
-            .get(&key)
-            .cloned()
-            .or_else(|| env::var("CODEX_SAVINGS_MODEL").ok())
-            .unwrap_or_else(|| {
-                snap.assumed_models += 1;
-                "gpt-5.5".to_string()
-            });
+    for month_dir in cycle_month_dirs(&snap.codex_home, cycle_start, today) {
+        if !month_dir.exists() {
+            continue;
+        }
+        for path in jsonl_files(&month_dir) {
+            let Some(file_date) = file_date(&path) else {
+                continue;
+            };
+            if file_date < cycle_start || file_date > today {
+                continue;
+            }
 
-        if let Some(session) = parse_session(&path, &model, &mut unknown) {
-            snap.month.add(session.clone());
-            if is_today_file(&path, now) {
-                snap.today.add(session);
+            let key = path_key(&path);
+            let model = metadata
+                .get(&key)
+                .cloned()
+                .or_else(|| env::var("CODEX_SAVINGS_MODEL").ok())
+                .unwrap_or_else(|| {
+                    snap.assumed_models += 1;
+                    "gpt-5.5".to_string()
+                });
+
+            if let Some(session) = parse_session(&path, &model, &mut unknown) {
+                snap.month.add(session.clone());
+                if file_date == today {
+                    snap.today.add(session);
+                }
             }
         }
     }
@@ -437,14 +554,11 @@ fn parse_session(path: &Path, model: &str, unknown: &mut HashSet<String>) -> Opt
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let Some(usage) = value
-            .pointer("/payload/info/total_token_usage")
-            .and_then(usage_from_json)
-        else {
+        let Some(usage) = usage_from_event(&value) else {
             continue;
         };
         let delta = match usage.total.cmp(&previous.total) {
-            Ordering::Less => usage,
+            CmpOrdering::Less => usage,
             _ => usage.delta(previous),
         };
         previous = usage;
@@ -481,6 +595,17 @@ fn usage_from_json(value: &Value) -> Option<Usage> {
     })
 }
 
+fn usage_from_event(value: &Value) -> Option<Usage> {
+    [
+        "/payload/info/total_token_usage",
+        "/payload/total_token_usage",
+        "/info/total_token_usage",
+        "/total_token_usage",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(usage_from_json))
+}
+
 fn cost(usage: Usage, model: &str, unknown: &mut HashSet<String>) -> f64 {
     let Some(price) = price_for_model(model) else {
         unknown.insert(model.to_string());
@@ -505,25 +630,149 @@ fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\").to_lowercase()
 }
 
-fn is_today_file(path: &Path, now: SYSTEMTIME) -> bool {
+fn file_date(path: &Path) -> Option<DateKey> {
     let day = path
         .parent()
         .and_then(Path::file_name)
-        .and_then(|s| s.to_str());
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u16>().ok())?;
     let month = path
         .parent()
         .and_then(Path::parent)
         .and_then(Path::file_name)
-        .and_then(|s| s.to_str());
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u16>().ok())?;
     let year = path
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
         .and_then(Path::file_name)
-        .and_then(|s| s.to_str());
-    day == Some(&format!("{:02}", now.wDay))
-        && month == Some(&format!("{:02}", now.wMonth))
-        && year == Some(&format!("{:04}", now.wYear))
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u16>().ok())?;
+    Some(DateKey { year, month, day })
+}
+
+fn date_from_system(time: SYSTEMTIME) -> DateKey {
+    DateKey {
+        year: time.wYear,
+        month: time.wMonth,
+        day: time.wDay,
+    }
+}
+
+fn current_cycle_start(today: DateKey, cycle_day: u16) -> DateKey {
+    let cycle_day = cycle_day.clamp(1, 31);
+    let this_start = DateKey {
+        year: today.year,
+        month: today.month,
+        day: cycle_day.min(last_day_of_month(today.year, today.month)),
+    };
+    if today >= this_start {
+        this_start
+    } else {
+        let (year, month) = previous_month(today.year, today.month);
+        DateKey {
+            year,
+            month,
+            day: cycle_day.min(last_day_of_month(year, month)),
+        }
+    }
+}
+
+fn next_cycle_start(today: DateKey, cycle_day: u16) -> DateKey {
+    let cycle_day = cycle_day.clamp(1, 31);
+    let start = current_cycle_start(today, cycle_day);
+    let (year, month) = next_month(start.year, start.month);
+    DateKey {
+        year,
+        month,
+        day: cycle_day.min(last_day_of_month(year, month)),
+    }
+}
+
+fn cycle_month_dirs(home: &Path, start: DateKey, end: DateKey) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let (mut year, mut month) = (start.year, start.month);
+    for _ in 0..14 {
+        dirs.push(
+            home.join("sessions")
+                .join(format!("{year:04}"))
+                .join(format!("{month:02}")),
+        );
+        if year == end.year && month == end.month {
+            break;
+        }
+        if month == 12 {
+            year += 1;
+            month = 1;
+        } else {
+            month += 1;
+        }
+    }
+    dirs
+}
+
+fn next_month(year: u16, month: u16) -> (u16, u16) {
+    if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    }
+}
+
+fn previous_month(year: u16, month: u16) -> (u16, u16) {
+    if month == 1 {
+        (year.saturating_sub(1), 12)
+    } else {
+        (year, month - 1)
+    }
+}
+
+fn last_day_of_month(year: u16, month: u16) -> u16 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 31,
+    }
+}
+
+fn is_leap_year(year: u16) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+fn days_between(start: DateKey, end: DateKey) -> i32 {
+    ordinal_day(end) - ordinal_day(start)
+}
+
+fn ordinal_day(date: DateKey) -> i32 {
+    let year = date.year as i32;
+    let years_before = year - 1;
+    let leap_days = years_before / 4 - years_before / 100 + years_before / 400;
+    let mut days = years_before * 365 + leap_days;
+    let mut month = 1u16;
+    while month < date.month {
+        days += last_day_of_month(date.year, month) as i32;
+        month += 1;
+    }
+    days + date.day as i32
+}
+
+fn format_date(date: DateKey) -> String {
+    format!("{:04}-{:02}-{:02}", date.year, date.month, date.day)
+}
+
+fn cycle_days_header_text(lang: Lang, days_left: i32) -> String {
+    if days_left == 1 {
+        t(lang, "1 day left", "1 día restante").to_string()
+    } else {
+        format!(
+            "{} {}",
+            days_left.max(0),
+            t(lang, "days left", "días restantes")
+        )
+    }
 }
 
 fn local_time() -> SYSTEMTIME {
@@ -536,6 +785,7 @@ fn local_time() -> SYSTEMTIME {
 
 unsafe fn run_tray() {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    let gdiplus_token = gdiplus_startup();
     SNAPSHOT.set(Mutex::new(Snapshot::default())).ok();
     let instance = GetModuleHandleW(null());
     let class = wide("CodexSavingsTray");
@@ -565,9 +815,11 @@ unsafe fn run_tray() {
         null_mut(),
     );
     if hwnd.is_null() {
+        gdiplus_shutdown(gdiplus_token);
         return;
     }
 
+    apply_window_visuals(hwnd, POPUP_W, POPUP_H);
     refresh(hwnd);
     tray_icon(hwnd, NIM_ADD);
     SetTimer(hwnd, TIMER_UID, 300_000, None);
@@ -577,6 +829,7 @@ unsafe fn run_tray() {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    gdiplus_shutdown(gdiplus_token);
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -603,6 +856,7 @@ unsafe extern "system" fn wnd_proc(
                 match id {
                     ID_REFRESH => refresh(hwnd),
                     ID_ALL_TIME => refresh_all_time(hwnd),
+                    ID_CYCLE_DAY => show_cycle_dialog(hwnd),
                     ID_OPEN_CONFIG => open_config(hwnd),
                     ID_OPEN_USAGE => open_url(hwnd, USAGE_URL),
                     ID_EXIT => {
@@ -632,7 +886,13 @@ unsafe extern "system" fn wnd_proc(
                 rect.bottom - rect.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            shape_window(hwnd, rect.right - rect.left, rect.bottom - rect.top);
+            apply_window_visuals(hwnd, rect.right - rect.left, rect.bottom - rect.top);
+            InvalidateRect(hwnd, null(), 1);
+            0
+        }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            apply_window_visuals(hwnd, scale(hwnd, POPUP_W), scale(hwnd, POPUP_H));
+            tray_icon(hwnd, NIM_MODIFY);
             InvalidateRect(hwnd, null(), 1);
             0
         }
@@ -658,11 +918,12 @@ unsafe fn refresh(hwnd: HWND) {
             .ok()
             .map(|s| (s.all_time.clone(), s.all_time_updated.clone()))
     });
-    let mut snap = scan_month().unwrap_or_else(|error| Snapshot {
+    let config = load_config();
+    let mut snap = scan_month(&config).unwrap_or_else(|error| Snapshot {
         error: Some(error),
+        config: config.clone(),
         ..Snapshot::default()
     });
-    snap.config = load_config();
     if let Some((all_time, updated)) = old_all_time {
         snap.all_time = all_time;
         snap.all_time_updated = updated;
@@ -685,43 +946,49 @@ unsafe fn refresh_all_time(hwnd: HWND) {
 }
 
 unsafe fn tray_icon(hwnd: HWND, action: u32) {
+    let snap = SNAPSHOT
+        .get()
+        .and_then(|s| s.lock().ok().map(|s| s.clone()));
     let mut data: NOTIFYICONDATAW = zeroed();
     data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = hwnd;
     data.uID = TRAY_UID;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_TRAYICON;
-    data.hIcon = app_icon();
+    let themed_icon = themed_tray_icon(system_theme().dark);
+    let destroy_icon = themed_icon.is_some();
+    data.hIcon = themed_icon.unwrap_or_else(|| app_icon());
 
-    let tip = SNAPSHOT
-        .get()
-        .and_then(|s| {
-            s.lock().ok().map(|s| {
-                let lang = current_lang(&s.config);
-                let plan = current_plan(&s.config);
-                let plan_usd = plan_usd(&s.config);
-                let mut tip = format!(
-                    "Codex {}: {} {}",
-                    plan_name(plan, lang),
-                    money(s.month.cost),
-                    t(lang, "this month", "este mes")
-                );
-                if plan_usd > 0.0 {
-                    tip.push_str(&format!(
-                        " ({:.0}% {})",
-                        s.month.cost / plan_usd * 100.0,
-                        plan_name(plan, lang)
-                    ));
-                }
-                if let Some(all_time) = &s.all_time {
-                    tip.push_str(&format!("; total {}", money(all_time.cost)));
-                }
-                truncate_chars(&tip, 126)
-            })
+    let tip = snap
+        .as_ref()
+        .map(|s| {
+            let lang = current_lang(&s.config);
+            let plan = current_plan(&s.config);
+            let plan_usd = plan_usd(&s.config);
+            let mut tip = format!(
+                "Codex {}: {} {}",
+                plan_name(plan, lang),
+                money(s.month.cost),
+                t(lang, "this cycle", "este ciclo")
+            );
+            if plan_usd > 0.0 {
+                tip.push_str(&format!(
+                    " ({:.0}% {})",
+                    s.month.cost / plan_usd * 100.0,
+                    plan_name(plan, lang)
+                ));
+            }
+            if let Some(all_time) = &s.all_time {
+                tip.push_str(&format!("; total {}", money(all_time.cost)));
+            }
+            truncate_chars(&tip, 126)
         })
         .unwrap_or_else(|| "Codex savings".to_string());
     copy_wide(&tip, &mut data.szTip);
     Shell_NotifyIconW(action, &data);
+    if destroy_icon {
+        DestroyIcon(data.hIcon);
+    }
 }
 
 unsafe fn toggle_popup(hwnd: HWND) {
@@ -740,14 +1007,57 @@ unsafe fn toggle_popup(hwnd: HWND) {
     let w = scale(hwnd, POPUP_W);
     let h = scale(hwnd, POPUP_H);
     let x = (pt.x - w + scale(hwnd, 20)).clamp(info.rcWork.left, info.rcWork.right - w);
-    let y = (pt.y - h - scale(hwnd, POPUP_GAP)).clamp(info.rcWork.top, info.rcWork.bottom - h);
-    shape_window(hwnd, w, h);
+    let y = anchored_popup_y(
+        pt.y,
+        h,
+        info.rcWork.top,
+        info.rcWork.bottom,
+        scale(hwnd, POPUP_GAP),
+    );
+    apply_window_visuals(hwnd, w, h);
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
     SetForegroundWindow(hwnd);
 }
 
-unsafe fn shape_window(hwnd: HWND, w: i32, h: i32) {
-    let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, scale(hwnd, 24), scale(hwnd, 24));
+unsafe fn apply_window_visuals(hwnd: HWND, w: i32, h: i32) {
+    let theme = system_theme();
+    let dark = i32::from(theme.dark);
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+        &dark as *const _ as *const c_void,
+        size_of::<i32>() as u32,
+    );
+
+    let border = DWM_COLOR_NONE;
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_BORDER_COLOR as u32,
+        &border as *const _ as *const c_void,
+        size_of::<COLORREF>() as u32,
+    );
+
+    let corner = DWM_WINDOW_CORNER_DONOTROUND;
+    DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+        &corner as *const _ as *const c_void,
+        size_of::<i32>() as u32,
+    );
+
+    let backdrop = DWMSBT_NONE;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_SYSTEMBACKDROP_TYPE as u32,
+        &backdrop as *const _ as *const c_void,
+        size_of::<i32>() as u32,
+    ) >= 0;
+    shape_window_region(hwnd, w, h);
+}
+
+unsafe fn shape_window_region(hwnd: HWND, w: i32, h: i32) {
+    let radius = scale(hwnd, WINDOW_RADIUS * 2);
+    let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
     if SetWindowRgn(hwnd, region, 1) == 0 {
         DeleteObject(region);
     }
@@ -789,6 +1099,17 @@ unsafe fn show_menu(hwnd: HWND) {
     AppendMenuW(
         menu,
         MF_STRING,
+        ID_CYCLE_DAY,
+        wide(&format!(
+            "{} {}",
+            t(lang, "Plan start day", "Día de inicio"),
+            config.cycle_day
+        ))
+        .as_ptr(),
+    );
+    AppendMenuW(
+        menu,
+        MF_STRING,
         ID_ALL_TIME,
         wide(t(lang, "Calculate total saved", "Calcular ahorro total")).as_ptr(),
     );
@@ -818,6 +1139,329 @@ unsafe fn show_menu(hwnd: HWND) {
     DestroyMenu(menu);
 }
 
+unsafe fn show_cycle_dialog(parent: HWND) {
+    let instance = GetModuleHandleW(null());
+    let class = wide("CodexSavingsCycleDialog");
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(cycle_dialog_proc),
+        hInstance: instance,
+        lpszClassName: class.as_ptr(),
+        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+        hIcon: app_icon(),
+        style: CS_DROPSHADOW,
+        ..zeroed()
+    };
+    RegisterClassW(&wc);
+
+    let dpi = dpi(parent);
+    let w = z(dpi, DIALOG_W);
+    let h = z(dpi, DIALOG_H);
+    let mut pt = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut pt);
+    let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..zeroed()
+    };
+    GetMonitorInfoW(monitor, &mut info);
+    let x = (pt.x - w / 2).clamp(info.rcWork.left, info.rcWork.right - w);
+    let y = anchored_popup_y(
+        pt.y,
+        h,
+        info.rcWork.top,
+        info.rcWork.bottom,
+        z(dpi, POPUP_GAP),
+    );
+
+    let config = load_config();
+    CYCLE_DIALOG_DAY.store(config.cycle_day.clamp(1, 31), Ordering::Relaxed);
+    let lang = current_lang(&config);
+    let hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        class.as_ptr(),
+        wide(t(lang, "Plan start date", "Fecha de inicio del plan")).as_ptr(),
+        WS_POPUP,
+        x,
+        y,
+        w,
+        h,
+        parent,
+        null_mut(),
+        instance,
+        null(),
+    );
+    if hwnd.is_null() {
+        return;
+    }
+    apply_window_visuals(hwnd, w, h);
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+}
+
+unsafe extern "system" fn cycle_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            paint_cycle_dialog(hwnd);
+            0
+        }
+        WM_LBUTTONUP => {
+            let dpi = dpi(hwnd);
+            let x = unscale(dpi, (lparam & 0xffff) as i16 as i32);
+            let y = unscale(dpi, ((lparam >> 16) & 0xffff) as i16 as i32);
+            if point_in_rect(x, y, [292, 16, 22, 22]) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if point_in_rect(x, y, [158, 340, 74, 30]) {
+                save_cycle_dialog(hwnd);
+                return 0;
+            }
+            if point_in_rect(x, y, [240, 340, 74, 30]) {
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            if let Some(day) = cycle_dialog_day_at(x, y) {
+                CYCLE_DIALOG_DAY.store(day, Ordering::Relaxed);
+                InvalidateRect(hwnd, null(), 1);
+            }
+            0
+        }
+        WM_KEYDOWN => {
+            match wparam as u32 {
+                VK_ESCAPE_CODE => {
+                    DestroyWindow(hwnd);
+                }
+                VK_RETURN_CODE => save_cycle_dialog(hwnd),
+                _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+            0
+        }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            apply_window_visuals(hwnd, scale(hwnd, DIALOG_W), scale(hwnd, DIALOG_H));
+            InvalidateRect(hwnd, null(), 1);
+            0
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn save_cycle_dialog(hwnd: HWND) {
+    let day = CYCLE_DIALOG_DAY.load(Ordering::Relaxed).clamp(1, 31);
+    set_cycle_day(day);
+    let parent = GetWindow(hwnd, GW_OWNER);
+    if !parent.is_null() {
+        refresh(parent);
+    }
+    DestroyWindow(hwnd);
+}
+
+fn cycle_dialog_day_at(x: i32, y: i32) -> Option<u16> {
+    let start_x = 22;
+    let start_y = 144;
+    let cell_w = 38;
+    let cell_h = 30;
+    let gap = 4;
+    for day in 1..=31 {
+        let index = day - 1;
+        let col = index % 7;
+        let row = index / 7;
+        let rect = [
+            start_x + col * (cell_w + gap),
+            start_y + row * (cell_h + gap),
+            cell_w,
+            cell_h,
+        ];
+        if point_in_rect(x, y, rect) {
+            return Some(day as u16);
+        }
+    }
+    None
+}
+
+unsafe fn paint_cycle_dialog(hwnd: HWND) {
+    let config = load_config();
+    let lang = current_lang(&config);
+    let theme = system_theme();
+    let selected = CYCLE_DIALOG_DAY.load(Ordering::Relaxed).clamp(1, 31);
+    let today = date_from_system(local_time());
+    let next_reset = next_cycle_start(today, selected);
+    let dpi = dpi(hwnd);
+    let mut ps = zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let ui = Ui { hdc, dpi };
+    let mut rect = zeroed();
+    GetClientRect(hwnd, &mut rect);
+
+    fill(hdc, rect, solid_from_argb(theme.bg));
+    round_frame_argb(
+        ui,
+        [1, 1, DIALOG_W - 2, DIALOG_H - 2],
+        WINDOW_RADIUS,
+        theme.border_argb,
+    );
+    SetBkMode(hdc, TRANSPARENT as i32);
+    SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+
+    draw_font(
+        ui,
+        t(lang, "Plan start date", "Fecha de inicio"),
+        [22, 18, 224, 24],
+        theme.text,
+        18,
+        700,
+    );
+    draw(
+        ui,
+        t(
+            lang,
+            "Choose the recurring monthly anchor.",
+            "Elige el día recurrente de cada mes.",
+        ),
+        [22, 45, 270, 20],
+        theme.muted,
+    );
+
+    dialog_close(ui, theme);
+    card(ui, theme, [20, 78, 290, 50], true);
+    draw_font(
+        ui,
+        &format!("{} {}", t(lang, "Day", "Día"), selected),
+        [36, 88, 78, 24],
+        theme.text,
+        18,
+        700,
+    );
+    draw(
+        ui,
+        t(lang, "Repeats monthly", "Se repite cada mes"),
+        [118, 91, 172, 18],
+        theme.muted,
+    );
+    draw(
+        ui,
+        &format!(
+            "{} {}",
+            t(lang, "Next reset", "Próximo reinicio"),
+            format_date(next_reset)
+        ),
+        [118, 108, 172, 18],
+        theme.subtle,
+    );
+
+    draw(
+        ui,
+        t(lang, "Start day", "Día de inicio"),
+        [24, 132, 120, 18],
+        theme.subtle,
+    );
+    for day in 1..=31 {
+        dialog_day_cell(ui, theme, day as u16, selected);
+    }
+
+    draw(
+        ui,
+        t(
+            lang,
+            "Short months use their last day.",
+            "Meses cortos usan su último día.",
+        ),
+        [24, 316, 284, 18],
+        theme.subtle,
+    );
+    dialog_button(
+        ui,
+        theme,
+        [158, 340, 74, 30],
+        t(lang, "Save", "Guardar"),
+        true,
+    );
+    dialog_button(
+        ui,
+        theme,
+        [240, 340, 74, 30],
+        t(lang, "Cancel", "Cancelar"),
+        false,
+    );
+
+    EndPaint(hwnd, &ps);
+}
+
+unsafe fn dialog_close(ui: Ui, theme: Theme) {
+    round_fill_argb(ui, [292, 16, 22, 22], CONTROL_RADIUS, theme.card_alt);
+    draw_center(ui, "x", [292, 18, 22, 18], theme.muted);
+}
+
+unsafe fn dialog_day_cell(ui: Ui, theme: Theme, day: u16, selected: u16) {
+    let index = day as i32 - 1;
+    let col = index % 7;
+    let row = index / 7;
+    let rect = [22 + col * 42, 144 + row * 34, 38, 30];
+    if day == selected {
+        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.accent_argb);
+        draw_font_center(
+            ui,
+            &day.to_string(),
+            [rect[0], rect[1] + 6, rect[2], 18],
+            rgb(255, 255, 255),
+            13,
+            700,
+        );
+    } else {
+        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.card);
+        round_frame_argb(ui, rect, CONTROL_RADIUS, theme.border_argb);
+        draw_font_center(
+            ui,
+            &day.to_string(),
+            [rect[0], rect[1] + 6, rect[2], 18],
+            theme.text,
+            13,
+            600,
+        );
+    }
+}
+
+unsafe fn dialog_button(ui: Ui, theme: Theme, rect: [i32; 4], label: &str, primary: bool) {
+    if primary {
+        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.accent_argb);
+        draw_font_center(
+            ui,
+            label,
+            [rect[0], rect[1] + 7, rect[2], 18],
+            rgb(255, 255, 255),
+            12,
+            700,
+        );
+    } else {
+        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.card_alt);
+        round_frame_argb(ui, rect, CONTROL_RADIUS, theme.border_argb);
+        draw_font_center(
+            ui,
+            label,
+            [rect[0], rect[1] + 7, rect[2], 18],
+            theme.text,
+            12,
+            600,
+        );
+    }
+}
+
+fn point_in_rect(x: i32, y: i32, rect: [i32; 4]) -> bool {
+    x >= rect[0] && x < rect[0] + rect[2] && y >= rect[1] && y < rect[1] + rect[3]
+}
+
+fn unscale(dpi: i32, value: i32) -> i32 {
+    (value * 96 + dpi / 2) / dpi
+}
+
 unsafe fn paint(hwnd: HWND) {
     let snap = SNAPSHOT
         .get()
@@ -827,29 +1471,36 @@ unsafe fn paint(hwnd: HWND) {
     let lang = current_lang(&snap.config);
     let plan = current_plan(&snap.config);
     let plan_usd = plan_usd(&snap.config);
+    let theme = system_theme();
     let mut ps = zeroed();
     let hdc = BeginPaint(hwnd, &mut ps);
     let ui = Ui { hdc, dpi };
     let mut rect = zeroed();
     GetClientRect(hwnd, &mut rect);
 
-    fill(hdc, rect, rgb(248, 249, 247));
-    round_frame(ui, [0, 0, POPUP_W, POPUP_H], 12, rgb(196, 201, 196));
+    fill(hdc, rect, solid_from_argb(theme.bg));
+    round_frame_argb(
+        ui,
+        [1, 1, POPUP_W - 2, POPUP_H - 2],
+        WINDOW_RADIUS,
+        theme.border_argb,
+    );
     SetBkMode(hdc, TRANSPARENT as i32);
     SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
 
-    draw(ui, "Codex", [18, 16, 300, 20], rgb(61, 67, 73));
-    let headline = money(snap.month.cost);
-    draw_big(ui, &headline, [18, 46, 180, 42], rgb(23, 28, 32));
-    draw(
+    draw_font(
         ui,
-        t(
-            lang,
-            "API value used this month",
-            "valor API usado este mes",
-        ),
-        [18, 88, 220, 20],
-        rgb(95, 104, 111),
+        plan_name(plan, lang),
+        [CONTENT_PAD, CONTENT_PAD, 210, 30],
+        theme.text,
+        20,
+        700,
+    );
+    draw_right(
+        ui,
+        &cycle_days_header_text(lang, snap.cycle_days_left),
+        [218, CONTENT_PAD + 7, 150, 18],
+        theme.subtle,
     );
 
     let pct = if plan_usd > 0.0 {
@@ -857,91 +1508,79 @@ unsafe fn paint(hwnd: HWND) {
     } else {
         0.0
     };
-    if plan_usd > 0.0 {
-        let pct_label = if pct > 1.0 {
-            format!("+{:.0}%", (pct - 1.0) * 100.0)
-        } else {
-            format!("{:.0}%", pct * 100.0)
-        };
-        draw_right(ui, &pct_label, [230, 54, 82, 24], rgb(23, 28, 32));
-    }
-    progress(ui, [18, 118, 294, 8], pct);
-
-    let plan_line = if plan_usd > 0.0 && snap.month.cost > plan_usd {
-        format!(
-            "{} {} (+{:.0}%)",
-            money(snap.month.cost - plan_usd),
-            t(lang, "over", "adicional"),
-            (pct - 1.0) * 100.0
-        )
+    let pct_label = if plan_usd > 0.0 && pct > 1.0 {
+        format!("+{:.0}%", (pct - 1.0) * 100.0)
     } else if plan_usd > 0.0 {
-        format!("{:.0}% {}", pct * 100.0, t(lang, "of plan", "del plan"))
+        format!("{:.0}%", pct * 100.0)
     } else {
-        plan_limit(plan, lang).to_string()
+        "--".to_string()
     };
-    draw(ui, &plan_line, [18, 138, 170, 20], rgb(61, 67, 73));
-    draw_right(
+
+    ring(ui, [30, 72, 114, 114], pct, theme);
+    let pct_font = if pct_label.chars().count() > 4 {
+        24
+    } else {
+        30
+    };
+    draw_font_center(ui, &pct_label, [44, 106, 86, 34], theme.text, pct_font, 650);
+    draw_center(ui, t(lang, "used", "usado"), [54, 140, 66, 20], theme.muted);
+
+    let month_cost = money(snap.month.cost);
+    draw_font(ui, &month_cost, [170, 78, 116, 34], theme.text, 24, 700);
+    if plan_usd > 0.0 {
+        let limit = format!("/ {}", money(plan_usd));
+        let month_w = font_text_width(ui, &month_cost, 24, 700);
+        let limit_w = font_text_width(ui, &limit, 12, 400);
+        let limit_x = (170 + month_w + 8).min(368 - limit_w);
+        draw_font(
+            ui,
+            &limit,
+            [limit_x, 92, 368 - limit_x, 18],
+            theme.muted,
+            12,
+            400,
+        );
+    } else {
+        draw(ui, plan_limit(plan, lang), [170, 114, 190, 20], theme.muted);
+    }
+    draw(
         ui,
         &format!("{} {}", t(lang, "today", "hoy"), money(snap.today.cost)),
-        [190, 138, 122, 20],
-        rgb(61, 67, 73),
+        [170, 120, 190, 20],
+        theme.text,
     );
-
-    let has_total = snap.all_time.is_some();
-    if let Some(all_time) = snap.all_time {
+    if plan_usd > 0.0 && snap.month.cost > plan_usd {
         draw(
             ui,
-            t(lang, "total", "total"),
-            [18, 160, 42, 18],
-            rgb(95, 104, 111),
+            &format!(
+                "{} {}",
+                t(lang, "over", "exceso"),
+                money(snap.month.cost - plan_usd)
+            ),
+            [170, 142, 190, 18],
+            theme.danger,
         );
-        draw_medium(
+    } else if plan_usd > 0.0 {
+        let remaining = (plan_usd - snap.month.cost).max(0.0);
+        draw(
             ui,
-            &money(all_time.cost),
-            [58, 154, 122, 26],
-            rgb(23, 28, 32),
-        );
-        draw_right(
-            ui,
-            &snap.all_time_updated,
-            [190, 160, 122, 18],
-            rgb(123, 130, 136),
+            &format!("{} {}", money(remaining), t(lang, "remaining", "restante")),
+            [170, 142, 190, 18],
+            theme.subtle,
         );
     }
-    let (metrics_y, status_y) = if has_total { (186, 216) } else { (166, 216) };
 
-    draw(
-        ui,
-        &format!("{} tokens", compact(snap.month.usage.total)),
-        [18, metrics_y, 96, 20],
-        rgb(95, 104, 111),
-    );
-    draw(
-        ui,
-        &format!("{} {}", snap.month.calls, t(lang, "calls", "llamadas")),
-        [124, metrics_y, 76, 20],
-        rgb(95, 104, 111),
-    );
-    draw(
-        ui,
-        &format!(
-            "{} {}",
-            snap.month.sessions,
-            t(lang, "sessions", "sesiones")
-        ),
-        [208, metrics_y, 104, 20],
-        rgb(95, 104, 111),
-    );
-
-    let status = snap.error.clone().unwrap_or_else(|| {
-        format!(
-            "{} - {} {}",
-            plan_name(plan, lang),
-            t(lang, "updated", "actualizado"),
-            snap.updated
-        )
-    });
-    draw(ui, &status, [18, status_y, 294, 18], rgb(123, 130, 136));
+    let footer_y = POPUP_H - CONTENT_PAD - 18;
+    if let Some(error) = &snap.error {
+        draw(ui, error, [CONTENT_PAD, footer_y, 210, 18], theme.danger);
+    } else {
+        draw_right(
+            ui,
+            &format!("{} {}", t(lang, "updated", "actualizado"), snap.updated),
+            [214, footer_y, 154, 18],
+            theme.subtle,
+        );
+    }
 
     EndPaint(hwnd, &ps);
 }
@@ -952,21 +1591,55 @@ unsafe fn fill(hdc: HDC, rect: RECT, color: COLORREF) {
     DeleteObject(brush);
 }
 
-unsafe fn progress(ui: Ui, rect: [i32; 4], pct: f64) {
-    let [x, y, w, h] = rect;
-    round_fill(ui, rect, 6, rgb(225, 229, 225));
-    let fill_w = (w as f64 * pct.clamp(0.0, 1.0)).round() as i32;
-    if fill_w > 0 {
+unsafe fn card(ui: Ui, theme: Theme, rect: [i32; 4], alt: bool) {
+    let fill = if alt { theme.card_alt } else { theme.card };
+    if !round_fill_argb(ui, rect, CONTROL_RADIUS, fill) {
+        round_fill(ui, rect, CONTROL_RADIUS, solid_from_argb(fill));
+    }
+    round_frame_argb(ui, rect, CONTROL_RADIUS, theme.border_argb);
+}
+
+unsafe fn ring(ui: Ui, rect: [i32; 4], pct: f64, theme: Theme) {
+    draw_arc(ui, rect, 12, 0.0, 360.0, colorref_to_argb(255, theme.track));
+    let sweep = 360.0 * pct.clamp(0.0, 1.0) as f32;
+    if sweep > 0.0 {
         let color = if pct > 1.0 {
-            rgb(177, 89, 73)
+            colorref_to_argb(255, theme.danger)
         } else {
-            rgb(44, 129, 103)
+            theme.accent_argb
         };
-        round_fill(ui, [x, y, fill_w, h], 6, color);
+        draw_arc(ui, rect, 12, -90.0, sweep, color);
     }
 }
 
+unsafe fn draw_arc(ui: Ui, rect: [i32; 4], width: i32, start: f32, sweep: f32, color: u32) {
+    with_gdiplus(ui.hdc, |graphics| {
+        let [x, y, w, h] = rect;
+        let mut pen: *mut GpPen = null_mut();
+        let ok = GdipCreatePen1(color, zf(ui.dpi, width), UnitPixel, &mut pen) == GdipOk
+            && !pen.is_null()
+            && GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapFlat) == GdipOk
+            && GdipDrawArc(
+                graphics,
+                pen,
+                zf(ui.dpi, x),
+                zf(ui.dpi, y),
+                zf(ui.dpi, w),
+                zf(ui.dpi, h),
+                start,
+                sweep,
+            ) == GdipOk;
+        if !pen.is_null() {
+            GdipDeletePen(pen);
+        }
+        ok
+    });
+}
+
 unsafe fn round_fill(ui: Ui, rect: [i32; 4], radius: i32, color: COLORREF) {
+    if round_fill_argb(ui, rect, radius, colorref_to_argb(255, color)) {
+        return;
+    }
     let [x, y, w, h] = rect.map(|v| z(ui.dpi, v));
     let region = round_region(ui, [x, y, w, h], radius);
     let brush = CreateSolidBrush(color);
@@ -975,19 +1648,111 @@ unsafe fn round_fill(ui: Ui, rect: [i32; 4], radius: i32, color: COLORREF) {
     DeleteObject(region);
 }
 
-unsafe fn round_frame(ui: Ui, rect: [i32; 4], radius: i32, color: COLORREF) {
-    let [x, y, w, h] = rect.map(|v| z(ui.dpi, v));
-    let region = round_region(ui, [x, y, w, h], radius);
-    let brush = CreateSolidBrush(color);
-    FrameRgn(ui.hdc, region, brush, z(ui.dpi, 1), z(ui.dpi, 1));
-    DeleteObject(brush);
-    DeleteObject(region);
-}
-
 unsafe fn round_region(ui: Ui, rect: [i32; 4], radius: i32) -> HRGN {
     let [x, y, w, h] = rect;
     let r = z(ui.dpi, radius * 2);
     CreateRoundRectRgn(x, y, x + w, y + h, r, r)
+}
+
+unsafe fn round_fill_argb(ui: Ui, rect: [i32; 4], radius: i32, color: u32) -> bool {
+    with_gdiplus(ui.hdc, |graphics| {
+        let Some(path) = rounded_path(ui.dpi, rect, radius, false) else {
+            return false;
+        };
+        let mut brush: *mut GpSolidFill = null_mut();
+        let ok = GdipCreateSolidFill(color, &mut brush) == GdipOk
+            && !brush.is_null()
+            && GdipFillPath(graphics, brush as *mut GpBrush, path) == GdipOk;
+        if !brush.is_null() {
+            GdipDeleteBrush(brush as *mut GpBrush);
+        }
+        GdipDeletePath(path);
+        ok
+    })
+}
+
+unsafe fn round_frame_argb(ui: Ui, rect: [i32; 4], radius: i32, color: u32) -> bool {
+    with_gdiplus(ui.hdc, |graphics| {
+        let Some(path) = rounded_path(ui.dpi, rect, radius, true) else {
+            return false;
+        };
+        let mut pen: *mut GpPen = null_mut();
+        let ok = GdipCreatePen1(color, zf(ui.dpi, 1), UnitPixel, &mut pen) == GdipOk
+            && !pen.is_null()
+            && GdipDrawPath(graphics, pen, path) == GdipOk;
+        if !pen.is_null() {
+            GdipDeletePen(pen);
+        }
+        GdipDeletePath(path);
+        ok
+    })
+}
+
+unsafe fn with_gdiplus<F>(hdc: HDC, draw: F) -> bool
+where
+    F: FnOnce(*mut GpGraphics) -> bool,
+{
+    let mut graphics: *mut GpGraphics = null_mut();
+    if GdipCreateFromHDC(hdc, &mut graphics) != GdipOk || graphics.is_null() {
+        return false;
+    }
+    GdipSetCompositingMode(graphics, CompositingModeSourceOver);
+    GdipSetCompositingQuality(graphics, CompositingQualityHighQuality);
+    GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+    GdipSetPixelOffsetMode(graphics, PixelOffsetModeHalf);
+    let ok = draw(graphics);
+    GdipDeleteGraphics(graphics);
+    ok
+}
+
+unsafe fn rounded_path(dpi: i32, rect: [i32; 4], radius: i32, stroke: bool) -> Option<*mut GpPath> {
+    let [x, y, w, h] = rect;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let inset = if stroke { 0.5 } else { 0.0 };
+    let x = zf(dpi, x) + inset;
+    let y = zf(dpi, y) + inset;
+    let w = (zf(dpi, w) - inset * 2.0).max(0.0);
+    let h = (zf(dpi, h) - inset * 2.0).max(0.0);
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let r = zf(dpi, radius).min(w / 2.0).min(h / 2.0).max(0.0);
+    let d = r * 2.0;
+
+    let mut path: *mut GpPath = null_mut();
+    if GdipCreatePath(FillModeWinding, &mut path) != GdipOk || path.is_null() {
+        return None;
+    }
+    if r <= 0.0 {
+        let ok = GdipAddPathLine(path, x, y, x + w, y) == GdipOk
+            && GdipAddPathLine(path, x + w, y, x + w, y + h) == GdipOk
+            && GdipAddPathLine(path, x + w, y + h, x, y + h) == GdipOk
+            && GdipAddPathLine(path, x, y + h, x, y) == GdipOk
+            && GdipClosePathFigure(path) == GdipOk;
+        if ok {
+            return Some(path);
+        }
+        GdipDeletePath(path);
+        return None;
+    }
+
+    let ok = GdipAddPathArc(path, x, y, d, d, 180.0, 90.0) == GdipOk
+        && GdipAddPathLine(path, x + r, y, x + w - r, y) == GdipOk
+        && GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0) == GdipOk
+        && GdipAddPathLine(path, x + w, y + r, x + w, y + h - r) == GdipOk
+        && GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0) == GdipOk
+        && GdipAddPathLine(path, x + w - r, y + h, x + r, y + h) == GdipOk
+        && GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0) == GdipOk
+        && GdipAddPathLine(path, x, y + h - r, x, y + r) == GdipOk
+        && GdipClosePathFigure(path) == GdipOk;
+    if ok {
+        Some(path)
+    } else {
+        GdipDeletePath(path);
+        None
+    }
 }
 
 unsafe fn draw(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
@@ -1022,15 +1787,85 @@ unsafe fn draw_right(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
     );
 }
 
-unsafe fn draw_big(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
-    draw_font(ui, text, rect, color, 30, 600);
-}
-
-unsafe fn draw_medium(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
-    draw_font(ui, text, rect, color, 17, 600);
+unsafe fn draw_center(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
+    let [x, y, w, h] = rect;
+    draw_text(
+        ui,
+        text,
+        RECT {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        },
+        color,
+        DT_CENTER,
+    );
 }
 
 unsafe fn draw_font(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF, size: i32, weight: i32) {
+    draw_font_aligned(ui, text, rect, color, size, weight, DT_LEFT);
+}
+
+unsafe fn font_text_width(ui: Ui, text: &str, size: i32, weight: i32) -> i32 {
+    let name = wide("Segoe UI");
+    let font = CreateFontW(
+        -z(ui.dpi, size),
+        0,
+        0,
+        0,
+        weight,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        name.as_ptr(),
+    );
+    if font.is_null() {
+        return 0;
+    }
+    let old = SelectObject(ui.hdc, font);
+    let text = wide(text);
+    let mut measured: SIZE = zeroed();
+    let ok = GetTextExtentPoint32W(
+        ui.hdc,
+        text.as_ptr(),
+        text.len().saturating_sub(1) as i32,
+        &mut measured,
+    ) != 0;
+    SelectObject(ui.hdc, old);
+    DeleteObject(font);
+    if ok {
+        unscale(ui.dpi, measured.cx)
+    } else {
+        0
+    }
+}
+
+unsafe fn draw_font_center(
+    ui: Ui,
+    text: &str,
+    rect: [i32; 4],
+    color: COLORREF,
+    size: i32,
+    weight: i32,
+) {
+    draw_font_aligned(ui, text, rect, color, size, weight, DT_CENTER);
+}
+
+unsafe fn draw_font_aligned(
+    ui: Ui,
+    text: &str,
+    rect: [i32; 4],
+    color: COLORREF,
+    size: i32,
+    weight: i32,
+    align: u32,
+) {
     let [x, y, w, h] = rect;
     let (hdc, dpi) = (ui.hdc, ui.dpi);
     let name = wide("Segoe UI");
@@ -1061,7 +1896,7 @@ unsafe fn draw_font(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF, size: i
             bottom: y + h,
         },
         color,
-        DT_LEFT,
+        align,
     );
     SelectObject(hdc, old);
     DeleteObject(font);
@@ -1099,6 +1934,145 @@ fn compact(value: u64) -> String {
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+fn solid_from_argb(color: u32) -> COLORREF {
+    rgb(
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+    )
+}
+
+fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
+    ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+fn colorref_to_argb(a: u8, color: COLORREF) -> u32 {
+    let r = (color & 0xff) as u8;
+    let g = ((color >> 8) & 0xff) as u8;
+    let b = ((color >> 16) & 0xff) as u8;
+    argb(a, r, g, b)
+}
+
+fn personalize_dword(name: &str, default: u32) -> u32 {
+    unsafe {
+        let mut value = default;
+        let mut size = size_of::<u32>() as u32;
+        let mut ty = 0u32;
+        let result = RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize").as_ptr(),
+            wide(name).as_ptr(),
+            RRF_RT_REG_DWORD,
+            &mut ty,
+            &mut value as *mut _ as *mut c_void,
+            &mut size,
+        );
+        if result == 0 {
+            value
+        } else {
+            default
+        }
+    }
+}
+
+fn windows_apps_dark() -> bool {
+    personalize_dword("AppsUseLightTheme", 1) == 0
+}
+
+unsafe fn themed_tray_icon(dark: bool) -> Option<HICON> {
+    let size = 32i32;
+    let source_icon = app_icon_sized(size);
+    if source_icon.is_null() {
+        return None;
+    }
+
+    let mut source: *mut GpBitmap = null_mut();
+    if GdipCreateBitmapFromHICON(source_icon, &mut source) != GdipOk || source.is_null() {
+        return None;
+    }
+
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size,
+            biHeight: -size,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..zeroed()
+        },
+        ..zeroed()
+    };
+    let mut bits: *mut c_void = null_mut();
+    let hbm_color = CreateDIBSection(null_mut(), &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    if hbm_color.is_null() || bits.is_null() {
+        if !hbm_color.is_null() {
+            DeleteObject(hbm_color);
+        }
+        GdipDisposeImage(source as *mut GpImage);
+        return None;
+    }
+
+    let pixels = slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
+    render_tray_icon_from_source(pixels, size, source, dark);
+    GdipDisposeImage(source as *mut GpImage);
+
+    let hbm_mask: HBITMAP = CreateBitmap(size, size, 1, 1, null());
+    if hbm_mask.is_null() {
+        DeleteObject(hbm_color);
+        return None;
+    }
+
+    let info = ICONINFO {
+        fIcon: 1,
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: hbm_mask,
+        hbmColor: hbm_color,
+    };
+    let icon = CreateIconIndirect(&info);
+    DeleteObject(hbm_color);
+    DeleteObject(hbm_mask);
+    (!icon.is_null()).then_some(icon)
+}
+
+unsafe fn render_tray_icon_from_source(
+    pixels: &mut [u32],
+    size: i32,
+    source: *mut GpBitmap,
+    dark: bool,
+) {
+    pixels.fill(0);
+    let foreground = if dark { 0x00ff_ffff } else { 0x0000_0000 };
+    for y in 0..size {
+        for x in 0..size {
+            let mut color = 0u32;
+            if GdipBitmapGetPixel(source, x, y, &mut color) != GdipOk {
+                continue;
+            }
+            let idx = (y * size + x) as usize;
+            pixels[idx] = extract_tray_stroke(color, foreground);
+        }
+    }
+}
+
+fn extract_tray_stroke(color: u32, foreground: u32) -> u32 {
+    let alpha = (color >> 24) & 0xff;
+    if alpha == 0 {
+        return 0;
+    }
+    let red = (color >> 16) & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = color & 0xff;
+    let luma = (red * 30 + green * 59 + blue * 11) / 100;
+    let stroke_alpha = alpha * (255 - luma) / 255;
+    if stroke_alpha == 0 {
+        0
+    } else {
+        (stroke_alpha << 24) | foreground
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -1144,10 +2118,17 @@ fn config_from_json(value: Value) -> Config {
         .get("monthly_usd_override")
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value >= 0.0);
+    let cycle_day = value
+        .get("cycle_day")
+        .and_then(Value::as_u64)
+        .filter(|day| (1..=31).contains(day))
+        .map(|day| day as u16)
+        .unwrap_or(default.cycle_day);
     Config {
         plan,
         monthly_usd_override,
         language,
+        cycle_day,
     }
 }
 
@@ -1165,6 +2146,7 @@ fn write_config(config: &Config) {
         "plan": config.plan.clone(),
         "monthly_usd_override": monthly,
         "language": config.language.clone(),
+        "cycle_day": config.cycle_day,
     });
     let _ = fs::write(
         path,
@@ -1188,6 +2170,12 @@ fn set_plan(id: &str) {
     let mut config = load_config();
     config.plan = id.to_string();
     config.monthly_usd_override = None;
+    write_config(&config);
+}
+
+fn set_cycle_day(day: u16) {
+    let mut config = load_config();
+    config.cycle_day = day.clamp(1, 31);
     write_config(&config);
 }
 
@@ -1256,6 +2244,10 @@ fn z(dpi: i32, value: i32) -> i32 {
     (value * dpi + 48) / 96
 }
 
+fn zf(dpi: i32, value: i32) -> f32 {
+    value as f32 * dpi as f32 / 96.0
+}
+
 fn dpi(hwnd: HWND) -> i32 {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     if dpi == 0 {
@@ -1269,14 +2261,49 @@ fn scale(hwnd: HWND, value: i32) -> i32 {
     z(dpi(hwnd), value)
 }
 
+fn anchored_popup_y(cursor_y: i32, popup_h: i32, work_top: i32, work_bottom: i32, gap: i32) -> i32 {
+    let max_y = (work_bottom - popup_h - gap).max(work_top);
+    (cursor_y - popup_h - gap).clamp(work_top, max_y)
+}
+
+unsafe fn gdiplus_startup() -> Option<usize> {
+    let input = GdiplusStartupInput {
+        GdiplusVersion: 1,
+        DebugEventCallback: 0,
+        SuppressBackgroundThread: 0,
+        SuppressExternalCodecs: 0,
+    };
+    let mut token = 0usize;
+    if GdiplusStartup(&mut token, &input, null_mut()) == GdipOk {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+unsafe fn gdiplus_shutdown(token: Option<usize>) {
+    if let Some(token) = token {
+        GdiplusShutdown(token);
+    }
+}
+
 unsafe fn app_icon() -> HICON {
+    app_icon_sized(0)
+}
+
+unsafe fn app_icon_sized(size: i32) -> HICON {
+    let flags = if size == 0 {
+        LR_DEFAULTSIZE | LR_SHARED
+    } else {
+        LR_SHARED
+    };
     let icon = LoadImageW(
         GetModuleHandleW(null()),
         std::ptr::without_provenance::<u16>(1),
         IMAGE_ICON,
-        0,
-        0,
-        LR_DEFAULTSIZE | LR_SHARED,
+        size,
+        size,
+        flags,
     ) as HICON;
     if icon.is_null() {
         LoadIconW(null_mut(), IDI_APPLICATION)
@@ -1336,6 +2363,26 @@ mod tests {
                         "total_tokens": total,
                     }
                 }
+            }
+        })
+        .to_string()
+    }
+
+    fn direct_usage_line(
+        input: u64,
+        cached: u64,
+        output: u64,
+        reasoning: u64,
+        total: u64,
+    ) -> String {
+        serde_json::json!({
+            "type": "token_count",
+            "total_token_usage": {
+                "input_tokens": input,
+                "cached_input_tokens": cached,
+                "output_tokens": output,
+                "reasoning_output_tokens": reasoning,
+                "total_tokens": total,
             }
         })
         .to_string()
@@ -1411,15 +2458,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_accepts_direct_codex_cli_usage_shape() {
+        let path = temp_jsonl(&direct_usage_line(40, 5, 10, 3, 50));
+        let mut unknown = HashSet::new();
+        let period = parse_session(&path, "gpt-5.5", &mut unknown).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(period.calls, 1);
+        assert_eq!(period.usage.input, 40);
+        assert_eq!(period.usage.cached, 5);
+        assert_eq!(period.usage.output, 10);
+        assert_eq!(period.usage.total, 50);
+    }
+
+    #[test]
     fn config_parses_plan_override_and_language() {
         let config = config_from_json(serde_json::json!({
             "plan": "pro_20x",
             "monthly_usd_override": 199.0,
-            "language": "es"
+            "language": "es",
+            "cycle_day": 15
         }));
         assert_eq!(current_plan(&config).id, "pro_20x");
         assert_eq!(plan_usd(&config), 199.0);
         assert_eq!(current_lang(&config), Lang::Es);
+        assert_eq!(config.cycle_day, 15);
     }
 
     #[test]
@@ -1427,11 +2490,112 @@ mod tests {
         let config = config_from_json(serde_json::json!({
             "plan": "unknown",
             "monthly_usd_override": -1.0,
-            "language": "fr"
+            "language": "fr",
+            "cycle_day": 40
         }));
         assert_eq!(current_plan(&config).id, "plus");
         assert_eq!(plan_usd(&config), 20.0);
         assert_eq!(config.language, "auto");
+        assert_eq!(config.cycle_day, 1);
+    }
+
+    #[test]
+    fn current_cycle_start_rolls_to_previous_month() {
+        let start = current_cycle_start(
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 1,
+            },
+            15,
+        );
+        assert_eq!(
+            start,
+            DateKey {
+                year: 2026,
+                month: 4,
+                day: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn current_cycle_start_clamps_long_month_day() {
+        let start = current_cycle_start(
+            DateKey {
+                year: 2026,
+                month: 3,
+                day: 1,
+            },
+            31,
+        );
+        assert_eq!(
+            start,
+            DateKey {
+                year: 2026,
+                month: 2,
+                day: 28,
+            }
+        );
+    }
+
+    #[test]
+    fn next_cycle_start_keeps_monthly_anchor_after_short_month() {
+        let next = next_cycle_start(
+            DateKey {
+                year: 2026,
+                month: 2,
+                day: 28,
+            },
+            31,
+        );
+        assert_eq!(
+            next,
+            DateKey {
+                year: 2026,
+                month: 3,
+                day: 31,
+            }
+        );
+    }
+
+    #[test]
+    fn next_cycle_start_clamps_leap_year_february() {
+        let next = next_cycle_start(
+            DateKey {
+                year: 2028,
+                month: 1,
+                day: 31,
+            },
+            31,
+        );
+        assert_eq!(
+            next,
+            DateKey {
+                year: 2028,
+                month: 2,
+                day: 29,
+            }
+        );
+    }
+
+    #[test]
+    fn days_between_handles_month_boundaries() {
+        assert_eq!(
+            days_between(
+                DateKey {
+                    year: 2026,
+                    month: 2,
+                    day: 28,
+                },
+                DateKey {
+                    year: 2026,
+                    month: 3,
+                    day: 31,
+                }
+            ),
+            31
+        );
     }
 
     #[test]
@@ -1447,6 +2611,17 @@ mod tests {
     fn tooltip_truncation_keeps_char_boundary() {
         assert_eq!(truncate_chars("abcdef", 3), "abc");
         assert_eq!(truncate_chars("ahorro", 20), "ahorro");
+    }
+
+    #[test]
+    fn anchored_popup_y_preserves_taskbar_gap() {
+        let y = anchored_popup_y(1062, 420, 0, 1032, 12);
+        assert_eq!(y + 420, 1020);
+    }
+
+    #[test]
+    fn anchored_popup_y_clamps_to_work_area_top_when_tight() {
+        assert_eq!(anchored_popup_y(40, 420, 20, 300, 12), 20);
     }
 
     #[test]

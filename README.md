@@ -4,12 +4,14 @@ Tiny Windows tray app that estimates the API-equivalent value of local Codex
 usage and compares the month-to-date total with your selected ChatGPT/Codex
 plan.
 
-It reads local Codex data only:
+It reads local Codex CLI/App data only:
 
-- `~/.codex/sessions/**/*.jsonl` for cumulative token usage.
+- `~/.codex/sessions/**/*.jsonl` for cumulative token usage emitted by Codex
+  CLI/App `token_count` events.
 - `~/.codex/state_5.sqlite` for the model attached to each rollout.
 
-No API keys, no network calls, no proxy.
+It does not read `auth.json`, copy tokens, use API keys, make network calls, or
+proxy requests.
 
 ## Use
 
@@ -22,8 +24,8 @@ Run the release executable:
 Tray actions:
 
 - Left click: show or hide the compact view.
-- Right click: choose `Plan`, `Reload`, `Calculate total saved`, `Open config`,
-  `Open usage dashboard`, or `Exit`.
+- Right click: choose `Plan`, `Reload`, `Plan start day`,
+  `Calculate total saved`, `Open config`, `Open usage dashboard`, or `Exit`.
 - Background refresh: month-to-date only, every 5 minutes.
 - All-time total: scanned only when selected, so old history does not cost
   resources during normal use.
@@ -40,13 +42,17 @@ Supported config values:
 {
   "plan": "plus",
   "monthly_usd_override": null,
-  "language": "auto"
+  "language": "auto",
+  "cycle_day": 1
 }
 ```
 
 `plan` can be `free`, `go`, `plus`, `pro_5x`, `pro_20x`, `business`,
 `enterprise_edu`, `api_key`, or `custom`. `language` can be `auto`, `en`, or
-`es`.
+`es`. `cycle_day` is the recurring monthly plan start day, from `1` to `31`.
+The app follows the common subscription anchor behavior used by services such
+as OpenAI and Stripe: renew on the same day of the month when possible, and use
+the month's last day when that day does not exist.
 
 Diagnostic CLI:
 
