@@ -63,6 +63,9 @@ Diagnostic CLI:
 .\target\release\codex-savings-tray.exe --once --all-time
 ```
 
+The diagnostic output includes `Pricing tier: standard` or `Pricing tier: fast`
+so the estimate makes the active multiplier visible.
+
 ## Build
 
 This repo is pinned to Rust stable MSVC through `rust-toolchain.toml`.
@@ -93,8 +96,8 @@ with the bundled SQLite feature.
 
 ## Release
 
-Create a tag such as `v0.1.0`, build locally, zip the release `.exe`, and
-create a GitHub Release.
+Create a tag such as `v0.2.1`, build locally, generate the versioned `.exe` and
+`.sha256` assets, and create a GitHub Release.
 
 See `docs/RELEASE.md` for the full checklist.
 
@@ -142,8 +145,15 @@ gpt-5.1-codex   input 1.25   cached 0.125   output 10.00
 Fast mode multipliers are applied to supported models only:
 
 ```text
-gpt-5.5 fast     x2.5
-gpt-5.4 fast     x2.0
+gpt-5.5 fast     x2.5 multiplier
+gpt-5.4 fast     x2.0 multiplier
+```
+
+Effective Fast mode prices are:
+
+```text
+gpt-5.5 fast     input 12.50  cached 1.25   output 75.00
+gpt-5.4 fast     input 5.00   cached 0.50   output 30.00
 ```
 
 Set `CODEX_SAVINGS_MODEL` to choose a fallback model if SQLite metadata is not

@@ -3,7 +3,7 @@
 1. Run local checks:
 
    ```powershell
-   cargo fmt --check
+   cargo fmt -- --check
    cargo test
    cargo clippy --all-targets -- -D warnings
    cargo audit
@@ -18,18 +18,22 @@
 4. Tag and push:
 
    ```powershell
-   git tag v0.1.0
+   git tag v0.2.1
    git push origin main
-   git push origin v0.1.0
+   git push origin v0.2.1
    ```
 
 5. Package and publish:
 
    ```powershell
+   $version = "v0.2.1"
+   $exeName = "codex-savings-tray-$version-windows-x64.exe"
+   $shaName = "codex-savings-tray-$version-windows-x64.sha256"
    New-Item -ItemType Directory -Force dist | Out-Null
-   Copy-Item target/release/codex-savings-tray.exe dist/
-   Compress-Archive -Path dist/codex-savings-tray.exe -DestinationPath dist/codex-savings-tray-windows-x64.zip -Force
-   gh release create v0.1.0 dist/codex-savings-tray-windows-x64.zip --title "Codex Savings Tray v0.1.0" --notes-file dist/release-notes-v0.1.0.md --latest
+   Copy-Item target/release/codex-savings-tray.exe "dist/$exeName" -Force
+   $hash = (Get-FileHash "dist/$exeName" -Algorithm SHA256).Hash.ToLowerInvariant()
+   "$hash  $exeName" | Set-Content -Path "dist/$shaName" -NoNewline -Encoding ascii
+   gh release create $version "dist/$exeName" "dist/$shaName" --title $version --notes-file "dist/release-notes-$version.md" --latest
    ```
 
 ## Signing

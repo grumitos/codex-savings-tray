@@ -8,7 +8,9 @@
 - Show the active pricing tier in `--once` output and include Fast mode rates
   in the local credit-rate summary.
 - Document the Fast mode estimation behavior, including the API-key standard
-  pricing caveat and historical-session fallback.
+  pricing caveat, historical-session fallback, explicit multipliers, and
+  effective Fast mode prices.
+- Refresh the manual release checklist with the current versioned asset flow.
 - Add regression tests for Fast mode pricing, event-level tier precedence, and
   config-file tier parsing.
 
