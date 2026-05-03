@@ -13,9 +13,13 @@
 
 2. Update `CHANGELOG.md` and bump `version` in `Cargo.toml`.
 
-3. Commit the release prep.
+3. Write bilingual release notes in `dist/release-notes-vX.Y.Z.md`, with
+   English and Spanish sections for highlights, validation, assets, and any
+   known caveats.
 
-4. Tag and push:
+4. Commit the release prep.
+
+5. Tag and push:
 
    ```powershell
    git tag v0.2.1
@@ -23,7 +27,7 @@
    git push origin v0.2.1
    ```
 
-5. Package and publish:
+6. Package and publish:
 
    ```powershell
    $version = "v0.2.1"

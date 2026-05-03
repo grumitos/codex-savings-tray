@@ -11,6 +11,7 @@
   pricing caveat, historical-session fallback, explicit multipliers, and
   effective Fast mode prices.
 - Refresh the manual release checklist with the current versioned asset flow.
+- Require bilingual English and Spanish release notes for future releases.
 - Add regression tests for Fast mode pricing, event-level tier precedence, and
   config-file tier parsing.
 
