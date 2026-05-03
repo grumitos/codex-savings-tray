@@ -31,6 +31,10 @@ Tray actions:
 - Background refresh: month-to-date only, every 5 minutes.
 - All-time total: scanned only when selected, so old history does not cost
   resources during normal use.
+- Single instance: running the `.exe` again replaces the existing tray process.
+  The new process asks the previous one to close cleanly; if the previous tray
+  window is hung, it terminates that process before opening. If the app crashed,
+  Windows releases the instance lock and the next launch starts normally.
 
 Config lives at:
 
@@ -106,6 +110,13 @@ See `docs/RELEASE.md` for the full checklist.
 For each token usage event, the app reads cumulative `total_token_usage` and
 adds only the delta from the previous event. This avoids double-counting repeat
 records.
+
+The current subscription cycle is split by each event's timestamp, converted to
+local date, not by the session file date alone. A session started before the
+plan start day and continued after it only contributes the in-cycle deltas. If
+the first visible in-cycle event already includes earlier accumulated totals,
+the app uses `last_token_usage` when Codex records it so earlier work is not
+charged to the current cycle.
 
 Cost is:
 

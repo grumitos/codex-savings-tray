@@ -14,6 +14,16 @@
 - Require bilingual English and Spanish release notes for future releases.
 - Add regression tests for Fast mode pricing, event-level tier precedence, and
   config-file tier parsing.
+- Split current-cycle and today totals by usage event timestamp, so sessions
+  started before the subscription day do not drag prior-cycle usage into the
+  current month.
+- Use `last_token_usage` for the first in-cycle event when available to avoid
+  counting accumulated usage from before the cycle boundary.
+- Shrink long popup numbers to fit instead of truncating high percentages or
+  large dollar amounts.
+- Enforce a single tray process. Relaunching the `.exe` replaces the existing
+  process, and a hung previous tray window is terminated before the new process
+  opens.
 
 ## 0.1.0 - 2026-04-28
 

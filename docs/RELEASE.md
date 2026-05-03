@@ -40,6 +40,17 @@
    gh release create $version "dist/$exeName" "dist/$shaName" --title $version --notes-file "dist/release-notes-$version.md" --latest
    ```
 
+   To refresh an existing release without changing the version, move the tag to
+   the new commit, replace the assets, and edit the release notes:
+
+   ```powershell
+   $version = "v0.2.1"
+   git tag -f $version
+   git push --force origin "refs/tags/$version"
+   gh release upload $version "dist/codex-savings-tray-$version-windows-x64.exe" "dist/codex-savings-tray-$version-windows-x64.sha256" --clobber
+   gh release edit $version --notes-file "dist/release-notes-$version.md" --latest
+   ```
+
 ## Signing
 
 The current local build can be signed with a local development certificate, but

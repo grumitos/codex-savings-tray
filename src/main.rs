@@ -19,7 +19,10 @@ use std::{
     },
 };
 use windows_sys::Win32::{
-    Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM},
+    Foundation::{
+        CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT,
+        POINT, RECT, SIZE, SYSTEMTIME, WAIT_OBJECT_0, WPARAM,
+    },
     Globalization::GetUserDefaultUILanguage,
     Graphics::Dwm::{
         DwmSetWindowAttribute, DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
@@ -49,6 +52,11 @@ use windows_sys::Win32::{
         LibraryLoader::GetModuleHandleW,
         Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
         SystemInformation::GetLocalTime,
+        Threading::{
+            CreateMutexW, OpenProcess, Sleep, TerminateProcess, WaitForSingleObject,
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        },
+        Time::SystemTimeToTzSpecificLocalTime,
     },
     UI::{
         HiDpi::{
@@ -64,6 +72,7 @@ use windows_sys::Win32::{
 };
 
 const WM_TRAYICON: u32 = WM_USER + 7;
+const WM_RESTART_INSTANCE: u32 = WM_APP + 1;
 const TRAY_UID: u32 = 1;
 const TIMER_UID: usize = 1;
 const ID_REFRESH: usize = 1001;
@@ -86,6 +95,12 @@ const CONTROL_RADIUS: i32 = 7;
 const DWM_COLOR_NONE: COLORREF = 0xffff_fffe;
 const DWM_WINDOW_CORNER_DONOTROUND: i32 = 1;
 const USAGE_URL: &str = "https://chatgpt.com/codex/cloud/settings/analytics";
+const APP_WINDOW_CLASS: &str = "CodexSavingsTray";
+const APP_WINDOW_TITLE: &str = "Codex Savings";
+const INSTANCE_MUTEX_NAME: &str = "Local\\CodexSavingsTraySingleInstance";
+const INSTANCE_CLOSE_TIMEOUT_MS: u32 = 750;
+const INSTANCE_WAIT_MS: u32 = 3_000;
+const INSTANCE_POLL_MS: u32 = 100;
 
 #[derive(Clone, Copy)]
 struct Price {
@@ -282,6 +297,18 @@ struct Snapshot {
     error: Option<String>,
 }
 
+struct InstanceGuard {
+    handle: HANDLE,
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
@@ -439,7 +466,7 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
     };
 
     let mut unknown = HashSet::new();
-    for month_dir in cycle_month_dirs(&snap.codex_home, cycle_start, today) {
+    for month_dir in cycle_scan_month_dirs(&snap.codex_home, cycle_start, today) {
         if !month_dir.exists() {
             continue;
         }
@@ -447,7 +474,7 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
             let Some(file_date) = file_date(&path) else {
                 continue;
             };
-            if file_date < cycle_start || file_date > today {
+            if file_date > today {
                 continue;
             }
 
@@ -461,11 +488,20 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
                     "gpt-5.5".to_string()
                 });
 
-            if let Some(session) = parse_session(&path, &model, service_tier, &mut unknown) {
-                snap.month.add(session.clone());
-                if file_date == today {
-                    snap.today.add(session);
-                }
+            if let Some(session) = parse_session_between(
+                &path,
+                &model,
+                service_tier,
+                cycle_start,
+                today,
+                &mut unknown,
+            ) {
+                snap.month.add(session);
+            }
+            if let Some(session) =
+                parse_session_between(&path, &model, service_tier, today, today, &mut unknown)
+            {
+                snap.today.add(session);
             }
         }
     }
@@ -602,7 +638,35 @@ fn parse_session(
     default_service_tier: ServiceTier,
     unknown: &mut HashSet<String>,
 ) -> Option<Period> {
+    parse_session_filtered(path, model, default_service_tier, None, unknown)
+}
+
+fn parse_session_between(
+    path: &Path,
+    model: &str,
+    default_service_tier: ServiceTier,
+    start: DateKey,
+    end: DateKey,
+    unknown: &mut HashSet<String>,
+) -> Option<Period> {
+    parse_session_filtered(
+        path,
+        model,
+        default_service_tier,
+        Some((start, end)),
+        unknown,
+    )
+}
+
+fn parse_session_filtered(
+    path: &Path,
+    model: &str,
+    default_service_tier: ServiceTier,
+    date_range: Option<(DateKey, DateKey)>,
+    unknown: &mut HashSet<String>,
+) -> Option<Period> {
     let file = File::open(path).ok()?;
+    let fallback_date = file_date(path);
     let mut previous = Usage::default();
     let mut period = Period {
         sessions: 1,
@@ -619,15 +683,31 @@ fn parse_session(
         let Some(usage) = usage_from_event(&value) else {
             continue;
         };
+        let had_previous = previous.any();
         let delta = match usage.total.cmp(&previous.total) {
             CmpOrdering::Less => usage,
             _ => usage.delta(previous),
         };
-        let service_tier = service_tier_from_event(&value).unwrap_or(default_service_tier);
         previous = usage;
         if !delta.any() {
             continue;
         }
+        if let Some((start, end)) = date_range {
+            let Some(event_date) = event_local_date(&value).or(fallback_date) else {
+                continue;
+            };
+            if event_date < start || event_date > end {
+                continue;
+            }
+        }
+        let delta = if date_range.is_some() && !had_previous {
+            last_usage_from_event(&value)
+                .filter(|usage| usage.any())
+                .unwrap_or(delta)
+        } else {
+            delta
+        };
+        let service_tier = service_tier_from_event(&value).unwrap_or(default_service_tier);
         period.usage.add(delta);
         period.cost += cost(delta, model, service_tier, unknown);
         period.calls += 1;
@@ -664,6 +744,17 @@ fn usage_from_event(value: &Value) -> Option<Usage> {
         "/payload/total_token_usage",
         "/info/total_token_usage",
         "/total_token_usage",
+    ]
+    .iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(usage_from_json))
+}
+
+fn last_usage_from_event(value: &Value) -> Option<Usage> {
+    [
+        "/payload/info/last_token_usage",
+        "/payload/last_token_usage",
+        "/info/last_token_usage",
+        "/last_token_usage",
     ]
     .iter()
     .find_map(|pointer| value.pointer(pointer).and_then(usage_from_json))
@@ -768,6 +859,70 @@ fn date_from_system(time: SYSTEMTIME) -> DateKey {
     }
 }
 
+fn event_local_date(value: &Value) -> Option<DateKey> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(local_date_from_utc_timestamp)
+}
+
+fn local_date_from_utc_timestamp(timestamp: &str) -> Option<DateKey> {
+    let utc = utc_system_time_from_timestamp(timestamp)?;
+    unsafe {
+        let mut local = zeroed();
+        if SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local) == 0 {
+            return None;
+        }
+        Some(date_from_system(local))
+    }
+}
+
+fn utc_system_time_from_timestamp(timestamp: &str) -> Option<SYSTEMTIME> {
+    let bytes = timestamp.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || !timestamp.ends_with('Z')
+    {
+        return None;
+    }
+    let year = parse_timestamp_part(bytes, 0, 4)?;
+    let month = parse_timestamp_part(bytes, 5, 7)?;
+    let day = parse_timestamp_part(bytes, 8, 10)?;
+    let hour = parse_timestamp_part(bytes, 11, 13)?;
+    let minute = parse_timestamp_part(bytes, 14, 16)?;
+    let second = parse_timestamp_part(bytes, 17, 19)?;
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > last_day_of_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(SYSTEMTIME {
+        wYear: year,
+        wMonth: month,
+        wDayOfWeek: 0,
+        wDay: day,
+        wHour: hour,
+        wMinute: minute,
+        wSecond: second,
+        wMilliseconds: 0,
+    })
+}
+
+fn parse_timestamp_part(bytes: &[u8], start: usize, end: usize) -> Option<u16> {
+    bytes.get(start..end)?.iter().try_fold(0u16, |value, byte| {
+        byte.is_ascii_digit()
+            .then_some(value * 10 + u16::from(byte - b'0'))
+    })
+}
+
 fn current_cycle_start(today: DateKey, cycle_day: u16) -> DateKey {
     let cycle_day = cycle_day.clamp(1, 31);
     let this_start = DateKey {
@@ -818,6 +973,19 @@ fn cycle_month_dirs(home: &Path, start: DateKey, end: DateKey) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+fn cycle_scan_month_dirs(home: &Path, cycle_start: DateKey, today: DateKey) -> Vec<PathBuf> {
+    let (year, month) = previous_month(cycle_start.year, cycle_start.month);
+    cycle_month_dirs(
+        home,
+        DateKey {
+            year,
+            month,
+            day: 1,
+        },
+        today,
+    )
 }
 
 fn next_month(year: u16, month: u16) -> (u16, u16) {
@@ -891,12 +1059,136 @@ fn local_time() -> SYSTEMTIME {
     }
 }
 
+unsafe fn claim_single_instance() -> Option<InstanceGuard> {
+    if let Some(guard) = try_claim_instance_mutex()? {
+        close_legacy_instance_window();
+        return Some(guard);
+    }
+
+    request_existing_instance_shutdown(false);
+    let attempts = (INSTANCE_WAIT_MS / INSTANCE_POLL_MS).max(1);
+    for _ in 0..attempts {
+        Sleep(INSTANCE_POLL_MS);
+        if let Some(guard) = try_claim_instance_mutex()? {
+            close_legacy_instance_window();
+            return Some(guard);
+        }
+    }
+
+    request_existing_instance_shutdown(true);
+    for _ in 0..attempts {
+        Sleep(INSTANCE_POLL_MS);
+        if let Some(guard) = try_claim_instance_mutex()? {
+            close_legacy_instance_window();
+            return Some(guard);
+        }
+    }
+
+    None
+}
+
+unsafe fn try_claim_instance_mutex() -> Option<Option<InstanceGuard>> {
+    let name = wide(INSTANCE_MUTEX_NAME);
+    let handle = CreateMutexW(null(), 0, name.as_ptr());
+    if handle.is_null() {
+        return None;
+    }
+    if GetLastError() == ERROR_ALREADY_EXISTS {
+        CloseHandle(handle);
+        Some(None)
+    } else {
+        Some(Some(InstanceGuard { handle }))
+    }
+}
+
+unsafe fn close_legacy_instance_window() {
+    request_existing_instance_shutdown(true);
+}
+
+unsafe fn request_existing_instance_shutdown(force_if_hung: bool) -> bool {
+    let hwnd = find_app_window();
+    if hwnd.is_null() {
+        return false;
+    }
+    let pid = window_process_id(hwnd);
+    let mut requested = send_instance_close_message(hwnd, WM_RESTART_INSTANCE);
+    if wait_for_app_window_to_close(INSTANCE_CLOSE_TIMEOUT_MS) {
+        return true;
+    }
+
+    let hwnd = find_app_window();
+    if !hwnd.is_null() {
+        requested |= send_instance_close_message(hwnd, WM_CLOSE);
+    }
+    if wait_for_app_window_to_close(INSTANCE_CLOSE_TIMEOUT_MS) {
+        return true;
+    }
+
+    if force_if_hung && pid != 0 {
+        return terminate_process(pid);
+    }
+    requested
+}
+
+unsafe fn find_app_window() -> HWND {
+    FindWindowW(
+        wide(APP_WINDOW_CLASS).as_ptr(),
+        wide(APP_WINDOW_TITLE).as_ptr(),
+    )
+}
+
+unsafe fn send_instance_close_message(hwnd: HWND, message: u32) -> bool {
+    let mut result = 0usize;
+    SendMessageTimeoutW(
+        hwnd,
+        message,
+        0,
+        0,
+        SMTO_ABORTIFHUNG,
+        INSTANCE_CLOSE_TIMEOUT_MS,
+        &mut result,
+    ) != 0
+}
+
+unsafe fn wait_for_app_window_to_close(timeout_ms: u32) -> bool {
+    let attempts = (timeout_ms / INSTANCE_POLL_MS).max(1);
+    for _ in 0..attempts {
+        if find_app_window().is_null() {
+            return true;
+        }
+        Sleep(INSTANCE_POLL_MS);
+    }
+    find_app_window().is_null()
+}
+
+unsafe fn window_process_id(hwnd: HWND) -> u32 {
+    let mut pid = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    pid
+}
+
+unsafe fn terminate_process(pid: u32) -> bool {
+    let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+    if process.is_null() {
+        return false;
+    }
+    let terminated = TerminateProcess(process, 1) != 0;
+    if terminated {
+        let _ = WaitForSingleObject(process, INSTANCE_WAIT_MS) == WAIT_OBJECT_0;
+    }
+    CloseHandle(process);
+    terminated
+}
+
 unsafe fn run_tray() {
+    let Some(instance_guard) = claim_single_instance() else {
+        return;
+    };
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     let gdiplus_token = gdiplus_startup();
     SNAPSHOT.set(Mutex::new(Snapshot::default())).ok();
     let instance = GetModuleHandleW(null());
-    let class = wide("CodexSavingsTray");
+    let class = wide(APP_WINDOW_CLASS);
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance,
@@ -911,7 +1203,7 @@ unsafe fn run_tray() {
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         class.as_ptr(),
-        wide("Codex Savings").as_ptr(),
+        wide(APP_WINDOW_TITLE).as_ptr(),
         WS_POPUP,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -938,6 +1230,9 @@ unsafe fn run_tray() {
         DispatchMessageW(&msg);
     }
     gdiplus_shutdown(gdiplus_token);
+    // Let Windows close the mutex at process teardown so replacements do not
+    // start while this process is still unwinding.
+    std::mem::forget(instance_guard);
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -947,6 +1242,10 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_RESTART_INSTANCE => {
+            DestroyWindow(hwnd);
+            0
+        }
         WM_TRAYICON => {
             match lparam as u32 {
                 WM_LBUTTONUP => toggle_popup(hwnd),
@@ -1596,12 +1895,13 @@ unsafe fn paint(hwnd: HWND) {
     SetBkMode(hdc, TRANSPARENT as i32);
     SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
 
-    draw_font(
+    draw_font_fit(
         ui,
         plan_name(plan, lang),
         [CONTENT_PAD, CONTENT_PAD, 210, 30],
         theme.text,
         20,
+        15,
         700,
     );
     draw_right(
@@ -1625,21 +1925,25 @@ unsafe fn paint(hwnd: HWND) {
     };
 
     ring(ui, [30, 72, 114, 114], pct, theme);
-    let pct_font = if pct_label.chars().count() > 4 {
-        24
-    } else {
-        30
-    };
-    draw_font_center(ui, &pct_label, [44, 106, 86, 34], theme.text, pct_font, 650);
+    draw_font_center_fit(ui, &pct_label, [44, 106, 86, 34], theme.text, 30, 16, 650);
     draw_center(ui, t(lang, "used", "usado"), [54, 140, 66, 20], theme.muted);
 
     let month_cost = money(snap.month.cost);
-    draw_font(ui, &month_cost, [170, 78, 116, 34], theme.text, 24, 700);
     if plan_usd > 0.0 {
         let limit = format!("/ {}", money(plan_usd));
-        let month_w = font_text_width(ui, &month_cost, 24, 700);
         let limit_w = font_text_width(ui, &limit, 12, 400);
-        let limit_x = (170 + month_w + 8).min(368 - limit_w);
+        let month_w = (368 - 170 - limit_w - 8).max(62);
+        let month_font = fitted_font_size(ui, &month_cost, month_w, 24, 15, 700);
+        draw_font(
+            ui,
+            &month_cost,
+            [170, 78, month_w, 34],
+            theme.text,
+            month_font,
+            700,
+        );
+        let rendered_month_w = font_text_width(ui, &month_cost, month_font, 700);
+        let limit_x = (170 + rendered_month_w + 8).min(368 - limit_w);
         draw_font(
             ui,
             &limit,
@@ -1649,16 +1953,20 @@ unsafe fn paint(hwnd: HWND) {
             400,
         );
     } else {
+        draw_font_fit(ui, &month_cost, [170, 78, 116, 34], theme.text, 24, 15, 700);
         draw(ui, plan_limit(plan, lang), [170, 114, 190, 20], theme.muted);
     }
-    draw(
+    draw_font_fit(
         ui,
         &format!("{} {}", t(lang, "today", "hoy"), money(snap.today.cost)),
         [170, 120, 190, 20],
         theme.text,
+        13,
+        10,
+        400,
     );
     if plan_usd > 0.0 && snap.month.cost > plan_usd {
-        draw(
+        draw_font_fit(
             ui,
             &format!(
                 "{} {}",
@@ -1667,14 +1975,20 @@ unsafe fn paint(hwnd: HWND) {
             ),
             [170, 142, 190, 18],
             theme.danger,
+            13,
+            10,
+            400,
         );
     } else if plan_usd > 0.0 {
         let remaining = (plan_usd - snap.month.cost).max(0.0);
-        draw(
+        draw_font_fit(
             ui,
             &format!("{} {}", money(remaining), t(lang, "remaining", "restante")),
             [170, 142, 190, 18],
             theme.subtle,
+            13,
+            10,
+            400,
         );
     }
 
@@ -1913,6 +2227,48 @@ unsafe fn draw_center(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
 
 unsafe fn draw_font(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF, size: i32, weight: i32) {
     draw_font_aligned(ui, text, rect, color, size, weight, DT_LEFT);
+}
+
+unsafe fn draw_font_fit(
+    ui: Ui,
+    text: &str,
+    rect: [i32; 4],
+    color: COLORREF,
+    size: i32,
+    min_size: i32,
+    weight: i32,
+) {
+    let size = fitted_font_size(ui, text, rect[2], size, min_size, weight);
+    draw_font_aligned(ui, text, rect, color, size, weight, DT_LEFT);
+}
+
+unsafe fn draw_font_center_fit(
+    ui: Ui,
+    text: &str,
+    rect: [i32; 4],
+    color: COLORREF,
+    size: i32,
+    min_size: i32,
+    weight: i32,
+) {
+    let size = fitted_font_size(ui, text, rect[2], size, min_size, weight);
+    draw_font_aligned(ui, text, rect, color, size, weight, DT_CENTER);
+}
+
+unsafe fn fitted_font_size(
+    ui: Ui,
+    text: &str,
+    max_width: i32,
+    size: i32,
+    min_size: i32,
+    weight: i32,
+) -> i32 {
+    let min_size = min_size.min(size);
+    let mut current = size;
+    while current > min_size && font_text_width(ui, text, current, weight) > max_width {
+        current -= 1;
+    }
+    current
 }
 
 unsafe fn font_text_width(ui: Ui, text: &str, size: i32, weight: i32) -> i32 {
@@ -2476,6 +2832,60 @@ mod tests {
         .to_string()
     }
 
+    fn usage_line_at(
+        timestamp: &str,
+        input: u64,
+        cached: u64,
+        output: u64,
+        reasoning: u64,
+        total: u64,
+    ) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input,
+                        "cached_input_tokens": cached,
+                        "output_tokens": output,
+                        "reasoning_output_tokens": reasoning,
+                        "total_tokens": total,
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn usage_line_with_last_at(timestamp: &str, total_usage: Usage, last_usage: Usage) -> String {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": total_usage.input,
+                        "cached_input_tokens": total_usage.cached,
+                        "output_tokens": total_usage.output,
+                        "reasoning_output_tokens": total_usage.reasoning,
+                        "total_tokens": total_usage.total,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": last_usage.input,
+                        "cached_input_tokens": last_usage.cached,
+                        "output_tokens": last_usage.output,
+                        "reasoning_output_tokens": last_usage.reasoning,
+                        "total_tokens": last_usage.total,
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
     fn direct_usage_line(
         input: u64,
         cached: u64,
@@ -2635,6 +3045,127 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_uses_standard_event_before_fast_default() {
+        let line = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "service_tier": "standard",
+                    "total_token_usage": {
+                        "input_tokens": 1_000_000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 1_000_000,
+                    }
+                }
+            }
+        })
+        .to_string();
+        let path = temp_jsonl(&line);
+        let mut unknown = HashSet::new();
+        let period = parse_session(&path, "gpt-5.5", ServiceTier::Fast, &mut unknown).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(period.cost, 5.0);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_session_between_counts_only_events_inside_cycle() {
+        let contents = [
+            usage_line_at("2026-05-23T12:00:00.000Z", 1_000_000, 0, 0, 0, 1_000_000),
+            usage_line_at("2026-05-24T12:00:00.000Z", 1_500_000, 0, 0, 0, 1_500_000),
+        ]
+        .join("\n");
+        let path = temp_jsonl(&contents);
+        let mut unknown = HashSet::new();
+        let period = parse_session_between(
+            &path,
+            "gpt-5.5",
+            ServiceTier::Standard,
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 24,
+            },
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 24,
+            },
+            &mut unknown,
+        )
+        .unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(period.calls, 1);
+        assert_eq!(period.usage.input, 500_000);
+        assert_eq!(period.cost, 2.5);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_session_between_uses_last_usage_for_first_observed_in_range() {
+        let contents = usage_line_with_last_at(
+            "2026-05-24T12:00:00.000Z",
+            Usage {
+                input: 1_500_000,
+                cached: 0,
+                output: 0,
+                reasoning: 0,
+                total: 1_500_000,
+            },
+            Usage {
+                input: 500_000,
+                cached: 0,
+                output: 0,
+                reasoning: 0,
+                total: 500_000,
+            },
+        );
+        let path = temp_jsonl(&contents);
+        let mut unknown = HashSet::new();
+        let period = parse_session_between(
+            &path,
+            "gpt-5.5",
+            ServiceTier::Standard,
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 24,
+            },
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 24,
+            },
+            &mut unknown,
+        )
+        .unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(period.calls, 1);
+        assert_eq!(period.usage.input, 500_000);
+        assert_eq!(period.cost, 2.5);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn service_tier_from_event_reads_speed_alias() {
+        let value = serde_json::json!({
+            "payload": {
+                "info": {
+                    "speed": "fast"
+                }
+            }
+        });
+
+        assert_eq!(service_tier_from_event(&value), Some(ServiceTier::Fast));
+    }
+
+    #[test]
     fn service_tier_from_toml_reads_fast_setting() {
         let contents = r#"
             model = "gpt-5.5"
@@ -2669,6 +3200,47 @@ mod tests {
         assert_eq!(plan_usd(&config), 20.0);
         assert_eq!(config.language, "auto");
         assert_eq!(config.cycle_day, 1);
+    }
+
+    #[test]
+    fn current_cycle_start_uses_today_on_cycle_day() {
+        let start = current_cycle_start(
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 24,
+            },
+            24,
+        );
+        assert_eq!(
+            start,
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 24,
+            }
+        );
+    }
+
+    #[test]
+    fn cycle_scan_month_dirs_includes_previous_month() {
+        let dirs = cycle_scan_month_dirs(
+            Path::new("C:\\codex"),
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 24,
+            },
+            DateKey {
+                year: 2026,
+                month: 5,
+                day: 26,
+            },
+        );
+
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].ends_with(Path::new("sessions\\2026\\04")));
+        assert!(dirs[1].ends_with(Path::new("sessions\\2026\\05")));
     }
 
     #[test]
