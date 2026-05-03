@@ -122,6 +122,28 @@ enum Lang {
     Es,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ServiceTier {
+    #[default]
+    Standard,
+    Fast,
+}
+
+impl ServiceTier {
+    fn from_str(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .trim_matches(['"', '\''])
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "standard" => Some(Self::Standard),
+            "fast" => Some(Self::Fast),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Plan {
     id: &'static str,
@@ -164,7 +186,7 @@ const PLANS: &[Plan] = &[
 ];
 
 const CREDIT_RATES: &str =
-    "Credits/1M tokens: 5.5 125/12.5/750; 5.4 62.5/6.25/375; mini 18.75/1.875/113";
+    "Credits/1M tokens: 5.5 125/12.5/750; 5.4 62.5/6.25/375; mini 18.75/1.875/113; fast 5.5 x2.5, 5.4 x2";
 
 #[derive(Clone)]
 struct Config {
@@ -251,6 +273,7 @@ struct Snapshot {
     updated: String,
     all_time_updated: String,
     codex_home: PathBuf,
+    service_tier: ServiceTier,
     cycle_start: DateKey,
     cycle_next: DateKey,
     cycle_days_left: i32,
@@ -269,6 +292,7 @@ impl Default for Snapshot {
             updated: String::new(),
             all_time_updated: String::new(),
             codex_home: codex_home(),
+            service_tier: ServiceTier::Standard,
             cycle_start: DateKey::default(),
             cycle_next: DateKey::default(),
             cycle_days_left: 0,
@@ -359,6 +383,7 @@ fn print_once(include_all_time: bool) {
     println!("Codex savings tray");
     println!("Home: {}", snap.codex_home.display());
     println!("Plan: {} ({}/month)", plan.en, money(plan_usd));
+    println!("Pricing tier: {}", service_tier_label(snap.service_tier));
     println!(
         "Plan cycle: day {} (current starts {}, next reset {})",
         snap.config.cycle_day,
@@ -396,6 +421,7 @@ fn print_once(include_all_time: bool) {
 
 fn scan_month(config: &Config) -> Result<Snapshot, String> {
     let home = codex_home();
+    let service_tier = configured_service_tier(&home);
     let now = local_time();
     let today = date_from_system(now);
     let cycle_start = current_cycle_start(today, config.cycle_day);
@@ -404,6 +430,7 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
     let mut snap = Snapshot {
         updated: format!("{:02}:{:02}", now.wHour, now.wMinute),
         codex_home: home,
+        service_tier,
         config: config.clone(),
         cycle_start,
         cycle_next,
@@ -434,7 +461,7 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
                     "gpt-5.5".to_string()
                 });
 
-            if let Some(session) = parse_session(&path, &model, &mut unknown) {
+            if let Some(session) = parse_session(&path, &model, service_tier, &mut unknown) {
                 snap.month.add(session.clone());
                 if file_date == today {
                     snap.today.add(session);
@@ -449,6 +476,7 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
 
 fn calculate_all_time(snap: &mut Snapshot) {
     let home = snap.codex_home.clone();
+    let service_tier = snap.service_tier;
     let metadata = load_metadata(&home);
     let mut period = Period::default();
     let mut unknown = HashSet::new();
@@ -463,7 +491,7 @@ fn calculate_all_time(snap: &mut Snapshot) {
                 snap.assumed_models += 1;
                 "gpt-5.5".to_string()
             });
-        if let Some(session) = parse_session(&path, &model, &mut unknown) {
+        if let Some(session) = parse_session(&path, &model, service_tier, &mut unknown) {
             period.add(session);
         }
     }
@@ -487,6 +515,35 @@ fn codex_home() -> PathBuf {
         .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .unwrap_or_else(|| PathBuf::from(".codex"))
+}
+
+fn configured_service_tier(codex_home: &Path) -> ServiceTier {
+    env::var("CODEX_SAVINGS_SERVICE_TIER")
+        .ok()
+        .and_then(|value| ServiceTier::from_str(&value))
+        .or_else(|| {
+            fs::read_to_string(codex_home.join("config.toml"))
+                .ok()
+                .and_then(|contents| service_tier_from_toml(&contents))
+        })
+        .unwrap_or_default()
+}
+
+fn service_tier_from_toml(contents: &str) -> Option<ServiceTier> {
+    contents.lines().find_map(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "service_tier")
+            .then(|| ServiceTier::from_str(value))
+            .flatten()
+    })
+}
+
+fn service_tier_label(tier: ServiceTier) -> &'static str {
+    match tier {
+        ServiceTier::Standard => "standard",
+        ServiceTier::Fast => "fast",
+    }
 }
 
 fn load_metadata(codex_home: &Path) -> HashMap<String, String> {
@@ -539,7 +596,12 @@ fn visit_jsonl(path: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn parse_session(path: &Path, model: &str, unknown: &mut HashSet<String>) -> Option<Period> {
+fn parse_session(
+    path: &Path,
+    model: &str,
+    default_service_tier: ServiceTier,
+    unknown: &mut HashSet<String>,
+) -> Option<Period> {
     let file = File::open(path).ok()?;
     let mut previous = Usage::default();
     let mut period = Period {
@@ -561,12 +623,13 @@ fn parse_session(path: &Path, model: &str, unknown: &mut HashSet<String>) -> Opt
             CmpOrdering::Less => usage,
             _ => usage.delta(previous),
         };
+        let service_tier = service_tier_from_event(&value).unwrap_or(default_service_tier);
         previous = usage;
         if !delta.any() {
             continue;
         }
         period.usage.add(delta);
-        period.cost += cost(delta, model, unknown);
+        period.cost += cost(delta, model, service_tier, unknown);
         period.calls += 1;
     }
 
@@ -606,11 +669,43 @@ fn usage_from_event(value: &Value) -> Option<Usage> {
     .find_map(|pointer| value.pointer(pointer).and_then(usage_from_json))
 }
 
-fn cost(usage: Usage, model: &str, unknown: &mut HashSet<String>) -> f64 {
-    let Some(price) = price_for_model(model) else {
+fn service_tier_from_event(value: &Value) -> Option<ServiceTier> {
+    [
+        "/payload/info/service_tier",
+        "/payload/service_tier",
+        "/info/service_tier",
+        "/service_tier",
+        "/payload/info/speed",
+        "/payload/speed",
+        "/info/speed",
+        "/speed",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(ServiceTier::from_str)
+    })
+}
+
+fn cost(
+    usage: Usage,
+    model: &str,
+    service_tier: ServiceTier,
+    unknown: &mut HashSet<String>,
+) -> f64 {
+    let Some((price_prefix, mut price)) = price_entry_for_model(model) else {
         unknown.insert(model.to_string());
         return 0.0;
     };
+    if service_tier == ServiceTier::Fast {
+        if let Some(multiplier) = fast_multiplier_for_model_prefix(price_prefix) {
+            price.input *= multiplier;
+            price.cached *= multiplier;
+            price.output *= multiplier;
+        }
+    }
     let uncached = usage.input.saturating_sub(usage.cached);
     (uncached as f64 * price.input
         + usage.cached as f64 * price.cached
@@ -618,12 +713,25 @@ fn cost(usage: Usage, model: &str, unknown: &mut HashSet<String>) -> f64 {
         / 1_000_000.0
 }
 
+#[cfg(test)]
 fn price_for_model(model: &str) -> Option<Price> {
+    price_entry_for_model(model).map(|(_, price)| price)
+}
+
+fn price_entry_for_model(model: &str) -> Option<(&'static str, Price)> {
     PRICES
         .iter()
         .filter(|(prefix, _)| model.starts_with(*prefix))
         .max_by_key(|(prefix, _)| prefix.len())
-        .map(|(_, price)| *price)
+        .map(|(prefix, price)| (*prefix, *price))
+}
+
+fn fast_multiplier_for_model_prefix(prefix: &str) -> Option<f64> {
+    match prefix {
+        "gpt-5.5" => Some(2.5),
+        "gpt-5.4" => Some(2.0),
+        _ => None,
+    }
 }
 
 fn path_key(path: &Path) -> String {
@@ -2396,6 +2504,33 @@ mod tests {
     }
 
     #[test]
+    fn fast_tier_multiplies_supported_models_only() {
+        let usage = Usage {
+            input: 1_000_000,
+            cached: 0,
+            output: 0,
+            reasoning: 0,
+            total: 1_000_000,
+        };
+        let mut unknown = HashSet::new();
+
+        assert_eq!(
+            cost(usage, "gpt-5.5", ServiceTier::Standard, &mut unknown),
+            5.0
+        );
+        assert_eq!(
+            cost(usage, "gpt-5.5", ServiceTier::Fast, &mut unknown),
+            12.5
+        );
+        assert_eq!(cost(usage, "gpt-5.4", ServiceTier::Fast, &mut unknown), 5.0);
+        assert_eq!(
+            cost(usage, "gpt-5.4-mini", ServiceTier::Fast, &mut unknown),
+            0.75
+        );
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
     fn usage_delta_saturates_per_field() {
         let current = Usage {
             input: 12,
@@ -2429,7 +2564,7 @@ mod tests {
         .join("\n");
         let path = temp_jsonl(&contents);
         let mut unknown = HashSet::new();
-        let period = parse_session(&path, "gpt-5.5", &mut unknown).unwrap();
+        let period = parse_session(&path, "gpt-5.5", ServiceTier::Standard, &mut unknown).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(period.calls, 2);
@@ -2448,7 +2583,7 @@ mod tests {
         let contents = [usage_line(100, 10, 10, 2, 110), usage_line(8, 0, 2, 1, 10)].join("\n");
         let path = temp_jsonl(&contents);
         let mut unknown = HashSet::new();
-        let period = parse_session(&path, "gpt-5.5", &mut unknown).unwrap();
+        let period = parse_session(&path, "gpt-5.5", ServiceTier::Standard, &mut unknown).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(period.calls, 2);
@@ -2461,7 +2596,7 @@ mod tests {
     fn parse_session_accepts_direct_codex_cli_usage_shape() {
         let path = temp_jsonl(&direct_usage_line(40, 5, 10, 3, 50));
         let mut unknown = HashSet::new();
-        let period = parse_session(&path, "gpt-5.5", &mut unknown).unwrap();
+        let period = parse_session(&path, "gpt-5.5", ServiceTier::Standard, &mut unknown).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(period.calls, 1);
@@ -2469,6 +2604,43 @@ mod tests {
         assert_eq!(period.usage.cached, 5);
         assert_eq!(period.usage.output, 10);
         assert_eq!(period.usage.total, 50);
+    }
+
+    #[test]
+    fn parse_session_uses_event_service_tier_before_default() {
+        let line = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "service_tier": "fast",
+                    "total_token_usage": {
+                        "input_tokens": 1_000_000,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 1_000_000,
+                    }
+                }
+            }
+        })
+        .to_string();
+        let path = temp_jsonl(&line);
+        let mut unknown = HashSet::new();
+        let period = parse_session(&path, "gpt-5.5", ServiceTier::Standard, &mut unknown).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(period.cost, 12.5);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn service_tier_from_toml_reads_fast_setting() {
+        let contents = r#"
+            model = "gpt-5.5"
+            service_tier = "fast"
+        "#;
+        assert_eq!(service_tier_from_toml(contents), Some(ServiceTier::Fast));
     }
 
     #[test]

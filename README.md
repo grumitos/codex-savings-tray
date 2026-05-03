@@ -9,6 +9,8 @@ It reads local Codex CLI/App data only:
 - `~/.codex/sessions/**/*.jsonl` for cumulative token usage emitted by Codex
   CLI/App `token_count` events.
 - `~/.codex/state_5.sqlite` for the model attached to each rollout.
+- `~/.codex/config.toml` for the default `service_tier` when a session event
+  does not include tier metadata.
 
 It does not read `auth.json`, copy tokens, use API keys, make network calls, or
 proxy requests.
@@ -115,6 +117,15 @@ cost =
 `reasoning_output_tokens` is shown as detail inside token totals but is not
 billed again because Codex total tokens equal input plus output.
 
+Fast mode is applied as a price multiplier, not as extra tokens. The app first
+uses `service_tier` or `speed` if Codex records it on the usage event. If not,
+it falls back to `CODEX_SAVINGS_SERVICE_TIER`, then `~/.codex/config.toml`, then
+`standard`. For historical sessions without event-level tier metadata, the
+configured tier is an estimate.
+
+Codex API-key usage should stay on `standard` pricing because Fast mode credits
+apply to ChatGPT-signed-in Codex usage, not API-key billing.
+
 ## Built-in Prices
 
 Prices are USD per 1M tokens:
@@ -128,5 +139,13 @@ gpt-5.2-codex   input 1.75   cached 0.175   output 14.00
 gpt-5.1-codex   input 1.25   cached 0.125   output 10.00
 ```
 
+Fast mode multipliers are applied to supported models only:
+
+```text
+gpt-5.5 fast     x2.5
+gpt-5.4 fast     x2.0
+```
+
 Set `CODEX_SAVINGS_MODEL` to choose a fallback model if SQLite metadata is not
-available. The default fallback is `gpt-5.5`.
+available. Set `CODEX_SAVINGS_SERVICE_TIER` to choose a fallback pricing tier
+when event metadata is missing. The defaults are `gpt-5.5` and `standard`.
