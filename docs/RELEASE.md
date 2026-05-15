@@ -3,7 +3,7 @@
 1. Run local checks:
 
    ```powershell
-   cargo fmt -- --check
+   cargo fmt --check
    cargo test
    cargo clippy --all-targets -- -D warnings
    cargo audit
@@ -11,20 +11,27 @@
    .\target\release\codex-savings-tray.exe --once --all-time
    ```
 
-2. Update `CHANGELOG.md` and bump `version` in `Cargo.toml`.
+   `cargo audit` requires the `cargo-audit` subcommand; install it before a
+   release if the command is not available locally.
+
+2. Update `CHANGELOG.md`, bump `version` in `Cargo.toml`, and choose the
+   release tag, for example `v0.2.1`.
 
 3. Write bilingual release notes in `dist/release-notes-vX.Y.Z.md`, with
    English and Spanish sections for highlights, validation, assets, and any
-   known caveats.
+   known caveats. `dist/` is ignored by git; these notes are local release
+   artifacts passed to `gh release`.
 
-4. Commit the release prep.
+4. Commit the tracked release prep, such as the version bump, changelog, and
+   documentation updates.
 
 5. Tag and push:
 
    ```powershell
-   git tag v0.2.1
+   $version = "v0.2.1"
+   git tag $version
    git push origin main
-   git push origin v0.2.1
+   git push origin $version
    ```
 
 6. Package and publish:
@@ -58,6 +65,5 @@ public releases should use a real code-signing certificate.
 
 ## CI Automation
 
-GitHub rejected workflow files from the local `gh` token because it lacks the
-`workflow` scope. After refreshing auth with that scope, add CI/release
-workflows and switch releases back to tag-triggered automation.
+No GitHub Actions workflow is tracked in this repo. Releases remain manual
+until a CI/release workflow is added intentionally.

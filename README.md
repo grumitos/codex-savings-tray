@@ -4,7 +4,8 @@ Tiny Windows tray app that estimates the API-equivalent value of local Codex
 usage and compares the month-to-date total with your selected ChatGPT/Codex
 plan.
 
-It reads local Codex CLI/App data only:
+It reads local Codex CLI/App data only. By default it uses `~/.codex`; set
+`CODEX_HOME` to point at a different Codex home:
 
 - `~/.codex/sessions/**/*.jsonl` for cumulative token usage emitted by Codex
   CLI/App `token_count` events.
@@ -13,7 +14,8 @@ It reads local Codex CLI/App data only:
   does not include tier metadata.
 
 It does not read `auth.json`, copy tokens, use API keys, make network calls, or
-proxy requests.
+proxy requests while scanning. The `Open usage dashboard` tray action only asks
+Windows to open the ChatGPT usage dashboard in your default browser.
 
 ## Use
 
@@ -94,6 +96,9 @@ cargo clippy --all-targets -- -D warnings
 cargo audit
 ```
 
+`cargo audit` requires the `cargo-audit` subcommand; install it outside this
+repo if the command is not available locally.
+
 The user who receives the built `.exe` does not need Rust, Python, MSYS2,
 SQLite, or Visual Studio Build Tools. SQLite is embedded through `rusqlite`
 with the bundled SQLite feature.
@@ -128,8 +133,8 @@ cost =
   + output_tokens * output_price
 ```
 
-`reasoning_output_tokens` is shown as detail inside token totals but is not
-billed again because Codex total tokens equal input plus output.
+`reasoning_output_tokens` is tracked with the token counters but is not billed
+again because Codex total tokens equal input plus output.
 
 Fast mode is applied as a price multiplier, not as extra tokens. The app first
 uses `service_tier` or `speed` if Codex records it on the usage event. If not,
@@ -145,12 +150,16 @@ apply to ChatGPT-signed-in Codex usage, not API-key billing.
 Prices are USD per 1M tokens:
 
 ```text
-gpt-5.5         input 5.00   cached 0.50    output 30.00
-gpt-5.4         input 2.50   cached 0.25    output 15.00
-gpt-5.4-mini    input 0.75   cached 0.075   output 4.50
-gpt-5.3-codex   input 1.75   cached 0.175   output 14.00
-gpt-5.2-codex   input 1.75   cached 0.175   output 14.00
-gpt-5.1-codex   input 1.25   cached 0.125   output 10.00
+gpt-5.5             input 5.00   cached 0.50    output 30.00
+gpt-5.4-mini        input 0.75   cached 0.075   output 4.50
+gpt-5.4-nano        input 0.20   cached 0.02    output 1.25
+gpt-5.4             input 2.50   cached 0.25    output 15.00
+gpt-5.3-codex       input 1.75   cached 0.175   output 14.00
+gpt-5.2-codex       input 1.75   cached 0.175   output 14.00
+gpt-5.1-codex-max   input 1.25   cached 0.125   output 10.00
+gpt-5.1-codex       input 1.25   cached 0.125   output 10.00
+gpt-5.1             input 1.25   cached 0.125   output 10.00
+gpt-5               input 1.25   cached 0.125   output 10.00
 ```
 
 Fast mode multipliers are applied to supported models only:
