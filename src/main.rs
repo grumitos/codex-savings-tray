@@ -3,126 +3,142 @@
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::{
-    cmp::Ordering as CmpOrdering,
     collections::{HashMap, HashSet},
     env,
     ffi::c_void,
     fs::{self, File},
     io::{BufRead, BufReader},
     mem::{size_of, zeroed},
+    os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     slice,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, Ordering},
         Mutex, OnceLock,
     },
+    thread,
+    time::SystemTime,
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT,
-        POINT, RECT, SIZE, SYSTEMTIME, WAIT_OBJECT_0, WPARAM,
+        CloseHandle, FreeLibrary, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, FILETIME, HANDLE,
+        HWND, LPARAM, LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
     },
     Globalization::GetUserDefaultUILanguage,
     Graphics::Dwm::{
         DwmSetWindowAttribute, DWMSBT_NONE, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
-        DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     },
     Graphics::Gdi::{
-        BeginPaint, CreateBitmap, CreateDIBSection, CreateFontW, CreateRoundRectRgn,
-        CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FillRgn, GetMonitorInfoW,
-        GetStockObject, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, SelectObject,
-        SetBkMode, SetTextColor, SetWindowRgn, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-        DT_RIGHT, DT_SINGLELINE, HBITMAP, HDC, HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-        TRANSPARENT,
+        BeginPaint, CreateBitmap, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteObject,
+        DrawTextW, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W,
+        InvalidateRect, MonitorFromPoint, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS,
+        DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, HBITMAP, HDC, HMONITOR, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, TRANSPARENT,
     },
     Graphics::GdiPlus::{
-        CompositingModeSourceOver, CompositingQualityHighQuality, DashCapFlat, FillModeWinding,
-        GdipAddPathArc, GdipAddPathLine, GdipBitmapGetPixel, GdipClosePathFigure,
-        GdipCreateBitmapFromHICON, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1,
-        GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen,
-        GdipDisposeImage, GdipDrawArc, GdipDrawPath, GdipFillPath, GdipSetCompositingMode,
+        CompositingModeSourceOver, CompositingQualityHighQuality, DashCapFlat, GdipBitmapGetPixel,
+        GdipCreateBitmapFromHICON, GdipCreateFromHDC, GdipCreatePen1, GdipDeleteGraphics,
+        GdipDeletePen, GdipDisposeImage, GdipDrawArc, GdipSetCompositingMode,
         GdipSetCompositingQuality, GdipSetPenLineCap197819, GdipSetPixelOffsetMode,
         GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap,
-        GpBrush, GpGraphics, GpImage, GpPath, GpPen, GpSolidFill, LineCapRound, Ok as GdipOk,
-        PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitPixel,
+        GpGraphics, GpImage, GpPen, LineCapRound, Ok as GdipOk, PixelOffsetModeHalf,
+        SmoothingModeAntiAlias, UnitPixel,
     },
     System::{
-        LibraryLoader::GetModuleHandleW,
+        LibraryLoader::{
+            GetModuleHandleW, GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        },
         Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
         SystemInformation::GetLocalTime,
-        Threading::{
-            CreateMutexW, OpenProcess, Sleep, TerminateProcess, WaitForSingleObject,
-            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        },
-        Time::SystemTimeToTzSpecificLocalTime,
+        Threading::{CreateMutexW, Sleep},
+        Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
     },
     UI::{
         HiDpi::{
-            GetDpiForWindow, SetProcessDpiAwarenessContext,
-            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
         },
         Shell::{
-            ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-            NIM_MODIFY, NOTIFYICONDATAW,
+            ShellExecuteW, Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE,
+            NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NOTIFYICONDATAW,
+            NOTIFYICONIDENTIFIER,
         },
         WindowsAndMessaging::*,
     },
 };
 
 const WM_TRAYICON: u32 = WM_USER + 7;
-const WM_RESTART_INSTANCE: u32 = WM_APP + 1;
+const WM_SHOW_POPUP: u32 = WM_APP + 1;
+const WM_REFRESHED: u32 = WM_APP + 2;
+const WM_ALL_TIME_REFRESHED: u32 = WM_APP + 3;
 const TRAY_UID: u32 = 1;
 const TIMER_UID: usize = 1;
+const HIDE_TIMER_UID: usize = 2;
 const ID_REFRESH: usize = 1001;
 const ID_EXIT: usize = 1002;
 const ID_ALL_TIME: usize = 1003;
 const ID_OPEN_CONFIG: usize = 1004;
 const ID_OPEN_USAGE: usize = 1005;
-const ID_CYCLE_DAY: usize = 1006;
 const ID_PLAN_BASE: usize = 1100;
-const VK_ESCAPE_CODE: u32 = 0x1b;
-const VK_RETURN_CODE: u32 = 0x0d;
+const ID_DAY_BASE: usize = 1200;
+const ID_LANG_BASE: usize = 1300;
+const ID_CUSTOM_MINUS_10: usize = 1400;
+const ID_CUSTOM_MINUS_1: usize = 1401;
+const ID_CUSTOM_PLUS_1: usize = 1402;
+const ID_CUSTOM_PLUS_10: usize = 1403;
 const POPUP_W: i32 = 392;
 const POPUP_H: i32 = 226;
 const POPUP_GAP: i32 = 12;
 const CONTENT_PAD: i32 = 24;
-const DIALOG_W: i32 = 330;
-const DIALOG_H: i32 = 388;
-const WINDOW_RADIUS: i32 = 16;
-const CONTROL_RADIUS: i32 = 7;
+const POPUP_ANIMATION_MS: u32 = 160;
 const DWM_COLOR_NONE: COLORREF = 0xffff_fffe;
-const DWM_WINDOW_CORNER_DONOTROUND: i32 = 1;
 const USAGE_URL: &str = "https://chatgpt.com/codex/cloud/settings/analytics";
 const APP_WINDOW_CLASS: &str = "CodexSavingsTray";
 const APP_WINDOW_TITLE: &str = "Codex Savings";
 const INSTANCE_MUTEX_NAME: &str = "Local\\CodexSavingsTraySingleInstance";
-const INSTANCE_CLOSE_TIMEOUT_MS: u32 = 750;
-const INSTANCE_WAIT_MS: u32 = 3_000;
-const INSTANCE_POLL_MS: u32 = 100;
 
 #[derive(Clone, Copy)]
 struct Price {
     input: f64,
     cached: f64,
+    cache_write: f64,
     output: f64,
+    long_context: bool,
 }
 
 const fn price(input: f64, cached: f64, output: f64) -> Price {
     Price {
         input,
         cached,
+        cache_write: input,
         output,
+        long_context: false,
+    }
+}
+
+const fn contextual_price(input: f64, cached: f64, cache_write: f64, output: f64) -> Price {
+    Price {
+        input,
+        cached,
+        cache_write,
+        output,
+        long_context: true,
     }
 }
 
 #[rustfmt::skip]
 const PRICES: &[(&str, Price)] = &[
-    ("gpt-5.5", price(5.0, 0.5, 30.0)),
+    ("gpt-5.6-sol", contextual_price(5.0, 0.5, 6.25, 30.0)),
+    ("gpt-5.6-terra", contextual_price(2.5, 0.25, 3.125, 15.0)),
+    ("gpt-5.6-luna", contextual_price(1.0, 0.1, 1.25, 6.0)),
+    ("gpt-5.6", contextual_price(5.0, 0.5, 6.25, 30.0)),
+    ("gpt-5.5", contextual_price(5.0, 0.5, 5.0, 30.0)),
     ("gpt-5.4-mini", price(0.75, 0.075, 4.5)),
     ("gpt-5.4-nano", price(0.20, 0.02, 1.25)),
-    ("gpt-5.4", price(2.5, 0.25, 15.0)),
+    ("gpt-5.4", contextual_price(2.5, 0.25, 2.5, 15.0)),
     ("gpt-5.3-codex", price(1.75, 0.175, 14.0)),
     ("gpt-5.2-codex", price(1.75, 0.175, 14.0)),
     ("gpt-5.1-codex-max", price(1.25, 0.125, 10.0)),
@@ -191,17 +207,17 @@ const fn plan(
 const PLANS: &[Plan] = &[
     plan("free", "Free", "Gratis", 0.0, "Quick tasks; see dashboard", "Tareas rapidas; ver panel"),
     plan("go", "Go", "Go", 8.0, "Lightweight tasks; see dashboard", "Tareas ligeras; ver panel"),
-    plan("plus", "Plus", "Plus", 20.0, "5h local: 5.5 15-80, 5.4 20-100", "5h local: 5.5 15-80, 5.4 20-100"),
-    plan("pro_5x", "Pro 5x", "Pro 5x", 100.0, "5h local: 5.5 80-400, 5.4 100-500", "5h local: 5.5 80-400, 5.4 100-500"),
-    plan("pro_20x", "Pro 20x", "Pro 20x", 200.0, "5h local: 5.5 300-1600, 5.4 400-2000", "5h local: 5.5 300-1600, 5.4 400-2000"),
-    plan("business", "Business", "Business", 0.0, "Pay as you go; seats often match Plus", "Pago por uso; asientos suelen igualar Plus"),
+    plan("plus", "Plus", "Plus", 20.0, "5h: Sol 15-90, Terra 20-110, Luna 50-280", "5h: Sol 15-90, Terra 20-110, Luna 50-280"),
+    plan("pro_5x", "Pro 5x", "Pro 5x", 100.0, "5h: Sol 75-450, Terra 100-550, Luna 250-1400", "5h: Sol 75-450, Terra 100-550, Luna 250-1400"),
+    plan("pro_20x", "Pro 20x", "Pro 20x", 200.0, "5h: Sol 300-1800, Terra 400-2200, Luna 1000-5600", "5h: Sol 300-1800, Terra 400-2200, Luna 1000-5600"),
+    plan("business", "Business", "Business", 20.0, "$20/user annual; Plus-like limits", "$20/usuario anual; limites tipo Plus"),
     plan("enterprise_edu", "Enterprise/Edu", "Enterprise/Edu", 0.0, "Credits or Plus-like seats", "Creditos o asientos tipo Plus"),
     plan("api_key", "API Key", "Clave API", 0.0, "Usage-based API pricing", "Precio API por uso"),
     plan("custom", "Custom", "Personalizado", 0.0, "Manual monthly amount", "Monto mensual manual"),
 ];
 
 const CREDIT_RATES: &str =
-    "Credits/1M tokens: 5.5 125/12.5/750; 5.4 62.5/6.25/375; mini 18.75/1.875/113; fast 5.5 x2.5, 5.4 x2";
+    "Credits/1M: Sol 125/12.5/750; Terra 62.5/6.25/375; Luna 25/2.5/150; fast 5.5 x2.5, 5.4 x2";
 
 #[derive(Clone)]
 struct Config {
@@ -233,6 +249,7 @@ struct DateKey {
 struct Usage {
     input: u64,
     cached: u64,
+    cache_write: u64,
     output: u64,
     reasoning: u64,
     total: u64,
@@ -242,6 +259,7 @@ impl Usage {
     fn add(&mut self, other: Usage) {
         self.input += other.input;
         self.cached += other.cached;
+        self.cache_write += other.cache_write;
         self.output += other.output;
         self.reasoning += other.reasoning;
         self.total += other.total;
@@ -251,6 +269,7 @@ impl Usage {
         Usage {
             input: self.input.saturating_sub(previous.input),
             cached: self.cached.saturating_sub(previous.cached),
+            cache_write: self.cache_write.saturating_sub(previous.cache_write),
             output: self.output.saturating_sub(previous.output),
             reasoning: self.reasoning.saturating_sub(previous.reasoning),
             total: self.total.saturating_sub(previous.total),
@@ -258,7 +277,7 @@ impl Usage {
     }
 
     fn any(self) -> bool {
-        self.input + self.cached + self.output + self.reasoning + self.total > 0
+        self.input + self.cached + self.cache_write + self.output + self.reasoning > 0
     }
 }
 
@@ -301,6 +320,24 @@ struct InstanceGuard {
     handle: HANDLE,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct CurrentCacheEntry {
+    stamp: FileStamp,
+    cycle_start: DateKey,
+    today: DateKey,
+    fallback_model: String,
+    service_tier: ServiceTier,
+    cycle: Option<Period>,
+    day: Option<Period>,
+    unknown_models: Vec<String>,
+}
+
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         unsafe {
@@ -331,7 +368,12 @@ impl Default for Snapshot {
 }
 
 static SNAPSHOT: OnceLock<Mutex<Snapshot>> = OnceLock::new();
-static CYCLE_DIALOG_DAY: AtomicU16 = AtomicU16::new(1);
+static CURRENT_CACHE: OnceLock<Mutex<HashMap<PathBuf, CurrentCacheEntry>>> = OnceLock::new();
+static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
+static THEMED_TRAY_ICONS: OnceLock<[usize; 2]> = OnceLock::new();
+static REFRESHING: AtomicBool = AtomicBool::new(false);
+static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static ALL_TIME_REFRESHING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct Ui {
@@ -343,45 +385,42 @@ struct Ui {
 struct Theme {
     dark: bool,
     bg: u32,
-    card: u32,
-    card_alt: u32,
-    border_argb: u32,
     text: COLORREF,
     muted: COLORREF,
     subtle: COLORREF,
     track: COLORREF,
     accent_argb: u32,
+    success: COLORREF,
+    warning: COLORREF,
     danger: COLORREF,
 }
 
 fn system_theme() -> Theme {
-    if windows_apps_dark() {
+    if windows_apps_dark() || windows_system_dark() {
         Theme {
             dark: true,
-            bg: argb(255, 28, 33, 43),
-            card: argb(255, 35, 41, 53),
-            card_alt: argb(255, 42, 49, 63),
-            border_argb: argb(118, 95, 106, 128),
-            text: rgb(243, 246, 250),
-            muted: rgb(190, 198, 210),
-            subtle: rgb(137, 149, 166),
-            track: rgb(52, 61, 78),
-            accent_argb: argb(255, 75, 119, 255),
-            danger: rgb(231, 121, 99),
+            bg: argb(255, 32, 32, 32),
+            text: rgb(255, 255, 255),
+            muted: rgb(211, 211, 211),
+            subtle: rgb(158, 158, 158),
+            track: rgb(64, 64, 64),
+            accent_argb: argb(255, 96, 205, 255),
+            success: rgb(108, 203, 95),
+            warning: rgb(252, 225, 0),
+            danger: rgb(255, 153, 164),
         }
     } else {
         Theme {
             dark: false,
-            bg: argb(255, 246, 250, 255),
-            card: argb(255, 255, 255, 255),
-            card_alt: argb(255, 236, 242, 252),
-            border_argb: argb(150, 194, 205, 219),
-            text: rgb(19, 24, 33),
-            muted: rgb(82, 91, 106),
-            subtle: rgb(118, 129, 145),
-            track: rgb(218, 226, 236),
-            accent_argb: argb(255, 74, 112, 245),
-            danger: rgb(190, 91, 76),
+            bg: argb(255, 243, 243, 243),
+            text: rgb(26, 26, 26),
+            muted: rgb(82, 82, 82),
+            subtle: rgb(112, 112, 112),
+            track: rgb(221, 221, 221),
+            accent_argb: argb(255, 0, 103, 192),
+            success: rgb(15, 123, 15),
+            warning: rgb(157, 93, 0),
+            danger: rgb(196, 43, 28),
         }
     }
 }
@@ -466,6 +505,8 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
     };
 
     let mut unknown = HashSet::new();
+    let fallback_model =
+        env::var("CODEX_SAVINGS_MODEL").unwrap_or_else(|_| "gpt-5.6-sol".to_string());
     for month_dir in cycle_scan_month_dirs(&snap.codex_home, cycle_start, today) {
         if !month_dir.exists() {
             continue;
@@ -477,30 +518,28 @@ fn scan_month(config: &Config) -> Result<Snapshot, String> {
             if file_date > today {
                 continue;
             }
+            if !session_may_overlap(&path, file_date, cycle_start) {
+                continue;
+            }
 
             let key = path_key(&path);
-            let model = metadata
-                .get(&key)
-                .cloned()
-                .or_else(|| env::var("CODEX_SAVINGS_MODEL").ok())
-                .unwrap_or_else(|| {
-                    snap.assumed_models += 1;
-                    "gpt-5.5".to_string()
-                });
+            let model = metadata.get(&key).cloned().unwrap_or_else(|| {
+                snap.assumed_models += 1;
+                fallback_model.clone()
+            });
 
-            if let Some(session) = parse_session_between(
+            let (cycle, day) = cached_session_current(
                 &path,
                 &model,
                 service_tier,
                 cycle_start,
                 today,
                 &mut unknown,
-            ) {
+            );
+            if let Some(session) = cycle {
                 snap.month.add(session);
             }
-            if let Some(session) =
-                parse_session_between(&path, &model, service_tier, today, today, &mut unknown)
-            {
+            if let Some(session) = day {
                 snap.today.add(session);
             }
         }
@@ -525,7 +564,7 @@ fn calculate_all_time(snap: &mut Snapshot) {
             .or_else(|| env::var("CODEX_SAVINGS_MODEL").ok())
             .unwrap_or_else(|| {
                 snap.assumed_models += 1;
-                "gpt-5.5".to_string()
+                "gpt-5.6-sol".to_string()
             });
         if let Some(session) = parse_session(&path, &model, service_tier, &mut unknown) {
             period.add(session);
@@ -566,13 +605,28 @@ fn configured_service_tier(codex_home: &Path) -> ServiceTier {
 }
 
 fn service_tier_from_toml(contents: &str) -> Option<ServiceTier> {
-    contents.lines().find_map(|line| {
+    let mut tier = None;
+    let mut in_features = false;
+    let mut fast_mode = false;
+    for line in contents.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
-        let (key, value) = line.split_once('=')?;
-        (key.trim() == "service_tier")
-            .then(|| ServiceTier::from_str(value))
-            .flatten()
-    })
+        if line.starts_with('[') {
+            in_features = line == "[features]";
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "service_tier" => tier = ServiceTier::from_str(value),
+            "fast_mode" if in_features => fast_mode = value.trim().eq_ignore_ascii_case("true"),
+            _ => {}
+        }
+    }
+    match tier {
+        Some(ServiceTier::Fast) if !fast_mode => Some(ServiceTier::Standard),
+        tier => tier,
+    }
 }
 
 fn service_tier_label(tier: ServiceTier) -> &'static str {
@@ -641,6 +695,7 @@ fn parse_session(
     parse_session_filtered(path, model, default_service_tier, None, unknown)
 }
 
+#[cfg(test)]
 fn parse_session_between(
     path: &Path,
     model: &str,
@@ -665,77 +720,242 @@ fn parse_session_filtered(
     date_range: Option<(DateKey, DateKey)>,
     unknown: &mut HashSet<String>,
 ) -> Option<Period> {
-    let file = File::open(path).ok()?;
-    let fallback_date = file_date(path);
-    let mut previous = Usage::default();
     let mut period = Period {
         sessions: 1,
         ..Period::default()
     };
-
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("\"total_token_usage\"") {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let Some(usage) = usage_from_event(&value) else {
-            continue;
-        };
-        let had_previous = previous.any();
-        let delta = match usage.total.cmp(&previous.total) {
-            CmpOrdering::Less => usage,
-            _ => usage.delta(previous),
-        };
-        previous = usage;
-        if !delta.any() {
-            continue;
-        }
-        if let Some((start, end)) = date_range {
-            let Some(event_date) = event_local_date(&value).or(fallback_date) else {
-                continue;
-            };
-            if event_date < start || event_date > end {
-                continue;
+    visit_session_deltas(
+        path,
+        model,
+        default_service_tier,
+        date_range.is_some(),
+        |delta, date, service_tier, current_model| {
+            if let Some((start, end)) = date_range {
+                let Some(date) = date else {
+                    return;
+                };
+                if date < start || date > end {
+                    return;
+                }
             }
-        }
-        let delta = if date_range.is_some() && !had_previous {
-            last_usage_from_event(&value)
-                .filter(|usage| usage.any())
-                .unwrap_or(delta)
-        } else {
-            delta
-        };
-        let service_tier = service_tier_from_event(&value).unwrap_or(default_service_tier);
-        period.usage.add(delta);
-        period.cost += cost(delta, model, service_tier, unknown);
-        period.calls += 1;
-    }
+            period.usage.add(delta);
+            period.cost += cost(delta, current_model, service_tier, unknown);
+            period.calls += 1;
+        },
+    )?;
 
     (period.calls > 0).then_some(period)
 }
 
+fn parse_session_current(
+    path: &Path,
+    model: &str,
+    default_service_tier: ServiceTier,
+    cycle_start: DateKey,
+    today: DateKey,
+    unknown: &mut HashSet<String>,
+) -> (Option<Period>, Option<Period>) {
+    let mut cycle = Period {
+        sessions: 1,
+        ..Period::default()
+    };
+    let mut day = cycle.clone();
+    let _ = visit_session_deltas(
+        path,
+        model,
+        default_service_tier,
+        true,
+        |delta, date, service_tier, current_model| {
+            let Some(date) = date else { return };
+            let event_cost = cost(delta, current_model, service_tier, unknown);
+            if (cycle_start..=today).contains(&date) {
+                cycle.usage.add(delta);
+                cycle.cost += event_cost;
+                cycle.calls += 1;
+            }
+            if date == today {
+                day.usage.add(delta);
+                day.cost += event_cost;
+                day.calls += 1;
+            }
+        },
+    );
+    (
+        (cycle.calls > 0).then_some(cycle),
+        (day.calls > 0).then_some(day),
+    )
+}
+
+fn cached_session_current(
+    path: &Path,
+    model: &str,
+    service_tier: ServiceTier,
+    cycle_start: DateKey,
+    today: DateKey,
+    unknown: &mut HashSet<String>,
+) -> (Option<Period>, Option<Period>) {
+    let Some(stamp) = file_stamp(path) else {
+        return parse_session_current(path, model, service_tier, cycle_start, today, unknown);
+    };
+    let cache = CURRENT_CACHE.get_or_init(Default::default);
+    if let Some(entry) = cache.lock().ok().and_then(|cache| cache.get(path).cloned()) {
+        if entry.stamp == stamp
+            && entry.cycle_start == cycle_start
+            && entry.today == today
+            && entry.fallback_model == model
+            && entry.service_tier == service_tier
+        {
+            unknown.extend(entry.unknown_models);
+            return (entry.cycle, entry.day);
+        }
+    }
+
+    let mut file_unknown = HashSet::new();
+    let (cycle, day) = parse_session_current(
+        path,
+        model,
+        service_tier,
+        cycle_start,
+        today,
+        &mut file_unknown,
+    );
+    unknown.extend(file_unknown.iter().cloned());
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(
+            path.to_path_buf(),
+            CurrentCacheEntry {
+                stamp,
+                cycle_start,
+                today,
+                fallback_model: model.to_string(),
+                service_tier,
+                cycle: cycle.clone(),
+                day: day.clone(),
+                unknown_models: file_unknown.into_iter().collect(),
+            },
+        );
+    }
+    (cycle, day)
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn session_may_overlap(path: &Path, created: DateKey, cycle_start: DateKey) -> bool {
+    created >= cycle_start || modified_local_date(path).is_none_or(|date| date >= cycle_start)
+}
+
+fn modified_local_date(path: &Path) -> Option<DateKey> {
+    let ticks = fs::metadata(path).ok()?.last_write_time();
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    unsafe {
+        let mut utc = zeroed();
+        let mut local = zeroed();
+        if FileTimeToSystemTime(&file_time, &mut utc) == 0
+            || SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local) == 0
+        {
+            return None;
+        }
+        Some(date_from_system(local))
+    }
+}
+
+fn visit_session_deltas(
+    path: &Path,
+    model: &str,
+    default_service_tier: ServiceTier,
+    dated: bool,
+    mut visit: impl FnMut(Usage, Option<DateKey>, ServiceTier, &str),
+) -> Option<()> {
+    const USAGE_MARKER: &str = "\"total_token_usage\"";
+    const CONTEXT_MARKER: &str = "\"turn_context\"";
+    let file = File::open(path).ok()?;
+    let fallback_date = file_date(path);
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut line = Vec::new();
+    let mut previous = Usage::default();
+    let mut current_model = model.to_string();
+
+    while reader.read_until(b'\n', &mut line).ok()? > 0 {
+        let Ok(text) = std::str::from_utf8(&line) else {
+            line.clear();
+            continue;
+        };
+        let has_usage = text.contains(USAGE_MARKER);
+        let has_context = text.contains(CONTEXT_MARKER);
+        if has_usage || has_context {
+            if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+                if has_context {
+                    if let Some(model) = model_from_event(&value) {
+                        current_model.clear();
+                        current_model.push_str(model);
+                    }
+                } else if let Some(usage) = usage_from_event(&value) {
+                    let had_previous = previous.any();
+                    let mut delta = if usage.total < previous.total {
+                        usage
+                    } else {
+                        usage.delta(previous)
+                    };
+                    previous = usage;
+                    if dated && !had_previous {
+                        delta = last_usage_from_event(&value)
+                            .filter(|usage| usage.any())
+                            .unwrap_or(delta);
+                    }
+                    if delta.any() {
+                        let date = dated
+                            .then(|| event_local_date(&value).or(fallback_date))
+                            .flatten();
+                        let tier = service_tier_from_event(&value).unwrap_or(default_service_tier);
+                        visit(delta, date, tier, &current_model);
+                    }
+                }
+            }
+        }
+        line.clear();
+    }
+    Some(())
+}
+
 fn usage_from_json(value: &Value) -> Option<Usage> {
+    let input = value.get("input_tokens")?.as_u64().unwrap_or(0);
+    let output = value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Some(Usage {
-        input: value.get("input_tokens")?.as_u64().unwrap_or(0),
+        input,
         cached: value
             .get("cached_input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        output: value
-            .get("output_tokens")
+        cache_write: value
+            .get("cache_write_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        output,
         reasoning: value
             .get("reasoning_output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        total: value
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        total: input.saturating_add(output),
     })
+}
+
+fn model_from_event(value: &Value) -> Option<&str> {
+    value
+        .pointer("/payload/model")
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str)
 }
 
 fn usage_from_event(value: &Value) -> Option<Usage> {
@@ -797,9 +1017,19 @@ fn cost(
             price.output *= multiplier;
         }
     }
-    let uncached = usage.input.saturating_sub(usage.cached);
+    if price.long_context && usage.input > 272_000 {
+        price.input *= 2.0;
+        price.cached *= 2.0;
+        price.cache_write *= 2.0;
+        price.output *= 1.5;
+    }
+    let uncached = usage
+        .input
+        .saturating_sub(usage.cached)
+        .saturating_sub(usage.cache_write);
     (uncached as f64 * price.input
         + usage.cached as f64 * price.cached
+        + usage.cache_write as f64 * price.cache_write
         + usage.output as f64 * price.output)
         / 1_000_000.0
 }
@@ -1060,31 +1290,21 @@ fn local_time() -> SYSTEMTIME {
 }
 
 unsafe fn claim_single_instance() -> Option<InstanceGuard> {
-    if let Some(guard) = try_claim_instance_mutex()? {
-        close_legacy_instance_window();
-        return Some(guard);
-    }
-
-    request_existing_instance_shutdown(false);
-    let attempts = (INSTANCE_WAIT_MS / INSTANCE_POLL_MS).max(1);
-    for _ in 0..attempts {
-        Sleep(INSTANCE_POLL_MS);
-        if let Some(guard) = try_claim_instance_mutex()? {
-            close_legacy_instance_window();
-            return Some(guard);
+    match try_claim_instance_mutex()? {
+        Some(guard) => Some(guard),
+        None => {
+            for _ in 0..10 {
+                let hwnd = find_app_window();
+                if !hwnd.is_null() {
+                    send_instance_message(hwnd, WM_SHOW_POPUP);
+                    SetForegroundWindow(hwnd);
+                    break;
+                }
+                Sleep(50);
+            }
+            None
         }
     }
-
-    request_existing_instance_shutdown(true);
-    for _ in 0..attempts {
-        Sleep(INSTANCE_POLL_MS);
-        if let Some(guard) = try_claim_instance_mutex()? {
-            close_legacy_instance_window();
-            return Some(guard);
-        }
-    }
-
-    None
 }
 
 unsafe fn try_claim_instance_mutex() -> Option<Option<InstanceGuard>> {
@@ -1101,35 +1321,6 @@ unsafe fn try_claim_instance_mutex() -> Option<Option<InstanceGuard>> {
     }
 }
 
-unsafe fn close_legacy_instance_window() {
-    request_existing_instance_shutdown(true);
-}
-
-unsafe fn request_existing_instance_shutdown(force_if_hung: bool) -> bool {
-    let hwnd = find_app_window();
-    if hwnd.is_null() {
-        return false;
-    }
-    let pid = window_process_id(hwnd);
-    let mut requested = send_instance_close_message(hwnd, WM_RESTART_INSTANCE);
-    if wait_for_app_window_to_close(INSTANCE_CLOSE_TIMEOUT_MS) {
-        return true;
-    }
-
-    let hwnd = find_app_window();
-    if !hwnd.is_null() {
-        requested |= send_instance_close_message(hwnd, WM_CLOSE);
-    }
-    if wait_for_app_window_to_close(INSTANCE_CLOSE_TIMEOUT_MS) {
-        return true;
-    }
-
-    if force_if_hung && pid != 0 {
-        return terminate_process(pid);
-    }
-    requested
-}
-
 unsafe fn find_app_window() -> HWND {
     FindWindowW(
         wide(APP_WINDOW_CLASS).as_ptr(),
@@ -1137,56 +1328,27 @@ unsafe fn find_app_window() -> HWND {
     )
 }
 
-unsafe fn send_instance_close_message(hwnd: HWND, message: u32) -> bool {
+unsafe fn send_instance_message(hwnd: HWND, message: u32) -> bool {
     let mut result = 0usize;
-    SendMessageTimeoutW(
-        hwnd,
-        message,
-        0,
-        0,
-        SMTO_ABORTIFHUNG,
-        INSTANCE_CLOSE_TIMEOUT_MS,
-        &mut result,
-    ) != 0
-}
-
-unsafe fn wait_for_app_window_to_close(timeout_ms: u32) -> bool {
-    let attempts = (timeout_ms / INSTANCE_POLL_MS).max(1);
-    for _ in 0..attempts {
-        if find_app_window().is_null() {
-            return true;
-        }
-        Sleep(INSTANCE_POLL_MS);
-    }
-    find_app_window().is_null()
-}
-
-unsafe fn window_process_id(hwnd: HWND) -> u32 {
-    let mut pid = 0;
-    GetWindowThreadProcessId(hwnd, &mut pid);
-    pid
-}
-
-unsafe fn terminate_process(pid: u32) -> bool {
-    let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
-    if process.is_null() {
-        return false;
-    }
-    let terminated = TerminateProcess(process, 1) != 0;
-    if terminated {
-        let _ = WaitForSingleObject(process, INSTANCE_WAIT_MS) == WAIT_OBJECT_0;
-    }
-    CloseHandle(process);
-    terminated
+    SendMessageTimeoutW(hwnd, message, 0, 0, SMTO_ABORTIFHUNG, 750, &mut result) != 0
 }
 
 unsafe fn run_tray() {
-    let Some(instance_guard) = claim_single_instance() else {
+    let Some(_instance_guard) = claim_single_instance() else {
         return;
     };
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    enable_native_dark_menus();
     let gdiplus_token = gdiplus_startup();
-    SNAPSHOT.set(Mutex::new(Snapshot::default())).ok();
+    TASKBAR_CREATED
+        .set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()))
+        .ok();
+    SNAPSHOT
+        .set(Mutex::new(Snapshot {
+            config: load_config(),
+            ..Snapshot::default()
+        }))
+        .ok();
     let instance = GetModuleHandleW(null());
     let class = wide(APP_WINDOW_CLASS);
     let wc = WNDCLASSW {
@@ -1219,9 +1381,9 @@ unsafe fn run_tray() {
         return;
     }
 
-    apply_window_visuals(hwnd, POPUP_W, POPUP_H);
-    refresh(hwnd);
+    apply_window_visuals(hwnd);
     tray_icon(hwnd, NIM_ADD);
+    request_refresh(hwnd);
     SetTimer(hwnd, TIMER_UID, 300_000, None);
 
     let mut msg = zeroed();
@@ -1230,9 +1392,6 @@ unsafe fn run_tray() {
         DispatchMessageW(&msg);
     }
     gdiplus_shutdown(gdiplus_token);
-    // Let Windows close the mutex at process teardown so replacements do not
-    // start while this process is still unwinding.
-    std::mem::forget(instance_guard);
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -1241,29 +1400,66 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if TASKBAR_CREATED.get().is_some_and(|message| msg == *message) {
+        tray_icon(hwnd, NIM_ADD);
+        return 0;
+    }
     match msg {
-        WM_RESTART_INSTANCE => {
-            DestroyWindow(hwnd);
+        WM_SHOW_POPUP => {
+            show_popup(hwnd);
             0
         }
         WM_TRAYICON => {
             match lparam as u32 {
-                WM_LBUTTONUP => toggle_popup(hwnd),
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                    KillTimer(hwnd, HIDE_TIMER_UID);
+                }
+                WM_LBUTTONUP => {
+                    KillTimer(hwnd, HIDE_TIMER_UID);
+                    toggle_popup(hwnd);
+                }
                 WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
                 _ => {}
             }
+            0
+        }
+        WM_LBUTTONUP => {
+            let x = unscale(dpi(hwnd), (lparam & 0xffff) as i16 as i32);
+            let y = unscale(dpi(hwnd), ((lparam >> 16) & 0xffff) as i16 as i32);
+            if x >= 340 && y < 56 {
+                show_menu(hwnd);
+            }
+            0
+        }
+        WM_CONTEXTMENU => {
+            show_menu(hwnd);
             0
         }
         WM_COMMAND => {
             let id = wparam & 0xffff;
             if (ID_PLAN_BASE..ID_PLAN_BASE + PLANS.len()).contains(&id) {
                 set_plan(PLANS[id - ID_PLAN_BASE].id);
-                refresh(hwnd);
+                apply_config_change(hwnd, false);
+            } else if (ID_DAY_BASE..ID_DAY_BASE + 31).contains(&id) {
+                set_cycle_day((id - ID_DAY_BASE + 1) as u16);
+                apply_config_change(hwnd, true);
+            } else if (ID_LANG_BASE..ID_LANG_BASE + 3).contains(&id) {
+                set_language(["auto", "en", "es"][id - ID_LANG_BASE]);
+                apply_config_change(hwnd, false);
             } else {
                 match id {
-                    ID_REFRESH => refresh(hwnd),
-                    ID_ALL_TIME => refresh_all_time(hwnd),
-                    ID_CYCLE_DAY => show_cycle_dialog(hwnd),
+                    ID_REFRESH => {
+                        request_refresh(hwnd);
+                        show_popup(hwnd);
+                    }
+                    ID_ALL_TIME => {
+                        request_all_time(hwnd);
+                        show_popup(hwnd);
+                    }
+                    ID_CUSTOM_MINUS_10 => adjust_custom_amount(-10.0),
+                    ID_CUSTOM_MINUS_1 => adjust_custom_amount(-1.0),
+                    ID_CUSTOM_PLUS_1 => adjust_custom_amount(1.0),
+                    ID_CUSTOM_PLUS_10 => adjust_custom_amount(10.0),
                     ID_OPEN_CONFIG => open_config(hwnd),
                     ID_OPEN_USAGE => open_url(hwnd, USAGE_URL),
                     ID_EXIT => {
@@ -1271,11 +1467,27 @@ unsafe extern "system" fn wnd_proc(
                     }
                     _ => {}
                 }
+                if (ID_CUSTOM_MINUS_10..=ID_CUSTOM_PLUS_10).contains(&id) {
+                    apply_config_change(hwnd, false);
+                }
             }
             0
         }
         WM_TIMER => {
-            refresh(hwnd);
+            if wparam == HIDE_TIMER_UID {
+                KillTimer(hwnd, HIDE_TIMER_UID);
+                hide_popup(hwnd);
+            } else {
+                request_refresh(hwnd);
+            }
+            0
+        }
+        WM_REFRESHED | WM_ALL_TIME_REFRESHED => {
+            tray_icon(hwnd, NIM_MODIFY);
+            InvalidateRect(hwnd, null(), 0);
+            if msg == WM_REFRESHED && REFRESH_PENDING.swap(false, Ordering::AcqRel) {
+                request_refresh(hwnd);
+            }
             0
         }
         WM_PAINT => {
@@ -1293,19 +1505,22 @@ unsafe extern "system" fn wnd_proc(
                 rect.bottom - rect.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
-            apply_window_visuals(hwnd, rect.right - rect.left, rect.bottom - rect.top);
+            apply_window_visuals(hwnd);
             InvalidateRect(hwnd, null(), 1);
             0
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
-            apply_window_visuals(hwnd, scale(hwnd, POPUP_W), scale(hwnd, POPUP_H));
+            enable_native_dark_menus();
+            apply_window_visuals(hwnd);
             tray_icon(hwnd, NIM_MODIFY);
             InvalidateRect(hwnd, null(), 1);
             0
         }
         WM_ACTIVATE => {
             if (wparam & 0xffff) == WA_INACTIVE as usize {
-                ShowWindow(hwnd, SW_HIDE);
+                SetTimer(hwnd, HIDE_TIMER_UID, 250, None);
+            } else {
+                KillTimer(hwnd, HIDE_TIMER_UID);
             }
             0
         }
@@ -1319,37 +1534,84 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-unsafe fn refresh(hwnd: HWND) {
-    let old_all_time = SNAPSHOT.get().and_then(|s| {
-        s.lock()
-            .ok()
-            .map(|s| (s.all_time.clone(), s.all_time_updated.clone()))
-    });
-    let config = load_config();
-    let mut snap = scan_month(&config).unwrap_or_else(|error| Snapshot {
-        error: Some(error),
-        config: config.clone(),
-        ..Snapshot::default()
-    });
-    if let Some((all_time, updated)) = old_all_time {
-        snap.all_time = all_time;
-        snap.all_time_updated = updated;
+fn request_refresh(hwnd: HWND) {
+    if REFRESHING.swap(true, Ordering::AcqRel) {
+        REFRESH_PENDING.store(true, Ordering::Release);
+        return;
     }
-    if let Some(lock) = SNAPSHOT.get() {
-        *lock.lock().unwrap() = snap;
-    }
-    tray_icon(hwnd, NIM_MODIFY);
-    InvalidateRect(hwnd, null(), 1);
+    let hwnd = hwnd as usize;
+    thread::spawn(move || {
+        let scan_config = load_config();
+        let mut snap = scan_month(&scan_config).unwrap_or_else(|error| Snapshot {
+            error: Some(error),
+            config: scan_config.clone(),
+            ..Snapshot::default()
+        });
+        let latest_config = load_config();
+        if latest_config.cycle_day != scan_config.cycle_day {
+            REFRESH_PENDING.store(true, Ordering::Release);
+        }
+        if let Some(lock) = SNAPSHOT.get() {
+            if let Ok(mut current) = lock.lock() {
+                snap.all_time = current.all_time.clone();
+                snap.all_time_updated = current.all_time_updated.clone();
+                snap.config = latest_config;
+                *current = snap;
+            }
+        }
+        REFRESHING.store(false, Ordering::Release);
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_REFRESHED, 0, 0);
+        }
+    });
 }
 
-unsafe fn refresh_all_time(hwnd: HWND) {
-    if let Some(lock) = SNAPSHOT.get() {
-        let mut snap = lock.lock().unwrap().clone();
+fn request_all_time(hwnd: HWND) {
+    if ALL_TIME_REFRESHING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(mut snap) = SNAPSHOT
+        .get()
+        .and_then(|lock| lock.lock().ok().map(|snap| snap.clone()))
+    else {
+        ALL_TIME_REFRESHING.store(false, Ordering::Release);
+        return;
+    };
+    let hwnd = hwnd as usize;
+    thread::spawn(move || {
         calculate_all_time(&mut snap);
-        *lock.lock().unwrap() = snap;
+        if let Some(lock) = SNAPSHOT.get() {
+            if let Ok(mut current) = lock.lock() {
+                current.all_time = snap.all_time;
+                current.all_time_updated = snap.all_time_updated;
+                for model in snap.unknown_models {
+                    if !current.unknown_models.contains(&model) {
+                        current.unknown_models.push(model);
+                    }
+                }
+                current.unknown_models.sort();
+            }
+        }
+        ALL_TIME_REFRESHING.store(false, Ordering::Release);
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_ALL_TIME_REFRESHED, 0, 0);
+        }
+    });
+}
+
+unsafe fn apply_config_change(hwnd: HWND, rescan: bool) {
+    let config = load_config();
+    if let Some(lock) = SNAPSHOT.get() {
+        if let Ok(mut snap) = lock.lock() {
+            snap.config = config;
+        }
     }
     tray_icon(hwnd, NIM_MODIFY);
-    InvalidateRect(hwnd, null(), 1);
+    InvalidateRect(hwnd, null(), 0);
+    if rescan {
+        request_refresh(hwnd);
+    }
+    show_popup(hwnd);
 }
 
 unsafe fn tray_icon(hwnd: HWND, action: u32) {
@@ -1362,9 +1624,7 @@ unsafe fn tray_icon(hwnd: HWND, action: u32) {
     data.uID = TRAY_UID;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = WM_TRAYICON;
-    let themed_icon = themed_tray_icon(system_theme().dark);
-    let destroy_icon = themed_icon.is_some();
-    data.hIcon = themed_icon.unwrap_or_else(|| app_icon());
+    data.hIcon = cached_themed_tray_icon(windows_system_dark()).unwrap_or_else(|| app_icon());
 
     let tip = snap
         .as_ref()
@@ -1393,40 +1653,149 @@ unsafe fn tray_icon(hwnd: HWND, action: u32) {
         .unwrap_or_else(|| "Codex savings".to_string());
     copy_wide(&tip, &mut data.szTip);
     Shell_NotifyIconW(action, &data);
-    if destroy_icon {
-        DestroyIcon(data.hIcon);
-    }
+}
+
+unsafe fn focus_tray_icon(hwnd: HWND) {
+    let mut data: NOTIFYICONDATAW = zeroed();
+    data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = hwnd;
+    data.uID = TRAY_UID;
+    Shell_NotifyIconW(NIM_SETFOCUS, &data);
 }
 
 unsafe fn toggle_popup(hwnd: HWND) {
     if IsWindowVisible(hwnd) != 0 {
-        ShowWindow(hwnd, SW_HIDE);
+        hide_popup(hwnd);
         return;
     }
-    let mut pt = POINT { x: 0, y: 0 };
-    GetCursorPos(&mut pt);
+    show_popup(hwnd);
+}
+
+unsafe fn show_popup(hwnd: HWND) {
+    let icon_rect = tray_icon_rect(hwnd);
+    let mut pt = icon_rect
+        .map(|rect| POINT {
+            x: (rect.left + rect.right) / 2,
+            y: rect.top,
+        })
+        .unwrap_or(POINT { x: 0, y: 0 });
+    if icon_rect.is_none() {
+        GetCursorPos(&mut pt);
+    }
     let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let target_dpi = monitor_dpi(monitor);
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..zeroed()
     };
     GetMonitorInfoW(monitor, &mut info);
-    let w = scale(hwnd, POPUP_W);
-    let h = scale(hwnd, POPUP_H);
-    let x = (pt.x - w + scale(hwnd, 20)).clamp(info.rcWork.left, info.rcWork.right - w);
-    let y = anchored_popup_y(
-        pt.y,
-        h,
-        info.rcWork.top,
-        info.rcWork.bottom,
-        scale(hwnd, POPUP_GAP),
-    );
-    apply_window_visuals(hwnd, w, h);
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    let w = z(target_dpi, POPUP_W);
+    let h = z(target_dpi, POPUP_H);
+    let gap = z(target_dpi, POPUP_GAP);
+    let (x, y) = if let Some(mut exclude) = icon_rect {
+        exclude.left -= gap;
+        exclude.top -= gap;
+        exclude.right += gap;
+        exclude.bottom += gap;
+        let anchor = POINT {
+            x: exclude.right,
+            y: exclude.top,
+        };
+        let size = SIZE { cx: w, cy: h };
+        let mut popup = zeroed();
+        if CalculatePopupWindowPosition(
+            &anchor,
+            &size,
+            TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_VERTICAL | TPM_WORKAREA,
+            &exclude,
+            &mut popup,
+        ) != 0
+        {
+            (popup.left, popup.top)
+        } else {
+            (
+                pt.x - w,
+                anchored_popup_y(pt.y, h, info.rcWork.top, info.rcWork.bottom, gap),
+            )
+        }
+    } else {
+        (
+            (pt.x - w + z(target_dpi, 20)).clamp(info.rcWork.left, info.rcWork.right - w),
+            anchored_popup_y(pt.y, h, info.rcWork.top, info.rcWork.bottom, gap),
+        )
+    };
+    let (x, y) = clamp_popup_origin(x, y, w, h, info.rcWork, gap);
+    SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+    apply_window_visuals(hwnd);
+    InvalidateRect(hwnd, null(), 1);
+    let (show_animation, _) = popup_animation_flags(pt, info.rcWork);
+    if AnimateWindow(
+        hwnd,
+        POPUP_ANIMATION_MS,
+        AW_ACTIVATE | AW_SLIDE | show_animation,
+    ) == 0
+    {
+        ShowWindow(hwnd, SW_SHOW);
+    }
     SetForegroundWindow(hwnd);
 }
 
-unsafe fn apply_window_visuals(hwnd: HWND, w: i32, h: i32) {
+unsafe fn hide_popup(hwnd: HWND) {
+    if IsWindowVisible(hwnd) == 0 {
+        return;
+    }
+    let mut rect = zeroed();
+    GetWindowRect(hwnd, &mut rect);
+    let monitor = MonitorFromPoint(
+        POINT {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        MONITOR_DEFAULTTONEAREST,
+    );
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..zeroed()
+    };
+    GetMonitorInfoW(monitor, &mut info);
+    let (_, hide_animation) = popup_animation_flags(
+        POINT {
+            x: (rect.left + rect.right) / 2,
+            y: (rect.top + rect.bottom) / 2,
+        },
+        info.rcWork,
+    );
+    if AnimateWindow(
+        hwnd,
+        POPUP_ANIMATION_MS,
+        AW_HIDE | AW_SLIDE | hide_animation,
+    ) == 0
+    {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+unsafe fn tray_icon_rect(hwnd: HWND) -> Option<RECT> {
+    let identifier = NOTIFYICONIDENTIFIER {
+        cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_UID,
+        ..zeroed()
+    };
+    let mut rect = zeroed();
+    (Shell_NotifyIconGetRect(&identifier, &mut rect) >= 0).then_some(rect)
+}
+
+unsafe fn monitor_dpi(monitor: HMONITOR) -> i32 {
+    let (mut x, mut y) = (96, 96);
+    if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) >= 0 {
+        x as i32
+    } else {
+        96
+    }
+}
+
+unsafe fn apply_window_visuals(hwnd: HWND) {
     let theme = system_theme();
     let dark = i32::from(theme.dark);
     DwmSetWindowAttribute(
@@ -1444,7 +1813,7 @@ unsafe fn apply_window_visuals(hwnd: HWND, w: i32, h: i32) {
         size_of::<COLORREF>() as u32,
     );
 
-    let corner = DWM_WINDOW_CORNER_DONOTROUND;
+    let corner = DWMWCP_ROUND;
     DwmSetWindowAttribute(
         hwnd,
         DWMWA_WINDOW_CORNER_PREFERENCE as u32,
@@ -1459,18 +1828,10 @@ unsafe fn apply_window_visuals(hwnd: HWND, w: i32, h: i32) {
         &backdrop as *const _ as *const c_void,
         size_of::<i32>() as u32,
     ) >= 0;
-    shape_window_region(hwnd, w, h);
-}
-
-unsafe fn shape_window_region(hwnd: HWND, w: i32, h: i32) {
-    let radius = scale(hwnd, WINDOW_RADIUS * 2);
-    let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius);
-    if SetWindowRgn(hwnd, region, 1) == 0 {
-        DeleteObject(region);
-    }
 }
 
 unsafe fn show_menu(hwnd: HWND) {
+    enable_native_dark_menus();
     let config = SNAPSHOT
         .get()
         .and_then(|s| s.lock().ok().map(|s| s.config.clone()))
@@ -1479,40 +1840,139 @@ unsafe fn show_menu(hwnd: HWND) {
     let menu = CreatePopupMenu();
     let plans = CreatePopupMenu();
     for (index, plan) in PLANS.iter().enumerate() {
-        let checked = if plan.id == config.plan {
-            MF_CHECKED
-        } else {
-            0
-        };
         AppendMenuW(
             plans,
-            MF_STRING | checked,
+            MF_STRING,
             ID_PLAN_BASE + index,
             wide(&plan_menu_label(plan, lang)).as_ptr(),
         );
     }
+    CheckMenuRadioItem(
+        plans,
+        ID_PLAN_BASE as u32,
+        (ID_PLAN_BASE + PLANS.len() - 1) as u32,
+        (ID_PLAN_BASE
+            + PLANS
+                .iter()
+                .position(|plan| plan.id == config.plan)
+                .unwrap_or(2)) as u32,
+        MF_BYCOMMAND,
+    );
     AppendMenuW(
         menu,
         MF_POPUP,
         plans as usize,
-        wide(t(lang, "Plan", "Plan")).as_ptr(),
+        wide(&format!(
+            "{} · {}",
+            t(lang, "Plan", "Plan"),
+            plan_name(current_plan(&config), lang)
+        ))
+        .as_ptr(),
     );
+
+    let days = CreatePopupMenu();
+    for day in 1..=31 {
+        let column = if day == 11 || day == 21 {
+            MF_MENUBARBREAK
+        } else {
+            0
+        };
+        AppendMenuW(
+            days,
+            MF_STRING | column,
+            ID_DAY_BASE + day - 1,
+            wide(&day.to_string()).as_ptr(),
+        );
+    }
+    CheckMenuRadioItem(
+        days,
+        ID_DAY_BASE as u32,
+        (ID_DAY_BASE + 30) as u32,
+        (ID_DAY_BASE + config.cycle_day.clamp(1, 31) as usize - 1) as u32,
+        MF_BYCOMMAND,
+    );
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        days as usize,
+        wide(&format!(
+            "{} · {}",
+            t(lang, "Cycle starts", "Inicio del ciclo"),
+            config.cycle_day
+        ))
+        .as_ptr(),
+    );
+
+    let languages = CreatePopupMenu();
+    for (index, label) in ["Automatico / Automatic", "English", "Español"]
+        .iter()
+        .enumerate()
+    {
+        AppendMenuW(
+            languages,
+            MF_STRING,
+            ID_LANG_BASE + index,
+            wide(label).as_ptr(),
+        );
+    }
+    let language_index = match config.language.as_str() {
+        "en" => 1,
+        "es" => 2,
+        _ => 0,
+    };
+    CheckMenuRadioItem(
+        languages,
+        ID_LANG_BASE as u32,
+        (ID_LANG_BASE + 2) as u32,
+        (ID_LANG_BASE + language_index) as u32,
+        MF_BYCOMMAND,
+    );
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        languages as usize,
+        wide(t(lang, "Language", "Idioma")).as_ptr(),
+    );
+
+    let custom = CreatePopupMenu();
+    AppendMenuW(
+        custom,
+        MF_STRING | MF_DISABLED,
+        0,
+        wide(&format!(
+            "{} / {}",
+            money(plan_usd(&config)),
+            t(lang, "month", "mes")
+        ))
+        .as_ptr(),
+    );
+    AppendMenuW(
+        custom,
+        MF_STRING,
+        ID_CUSTOM_MINUS_10,
+        wide("- $10").as_ptr(),
+    );
+    AppendMenuW(custom, MF_STRING, ID_CUSTOM_MINUS_1, wide("- $1").as_ptr());
+    AppendMenuW(custom, MF_STRING, ID_CUSTOM_PLUS_1, wide("+ $1").as_ptr());
+    AppendMenuW(custom, MF_STRING, ID_CUSTOM_PLUS_10, wide("+ $10").as_ptr());
+    AppendMenuW(
+        menu,
+        MF_POPUP,
+        custom as usize,
+        wide(t(
+            lang,
+            "Custom monthly amount",
+            "Monto mensual personalizado",
+        ))
+        .as_ptr(),
+    );
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(
         menu,
         MF_STRING,
         ID_REFRESH,
         wide(t(lang, "Reload", "Recargar")).as_ptr(),
-    );
-    AppendMenuW(
-        menu,
-        MF_STRING,
-        ID_CYCLE_DAY,
-        wide(&format!(
-            "{} {}",
-            t(lang, "Plan start day", "Día de inicio"),
-            config.cycle_day
-        ))
-        .as_ptr(),
     );
     AppendMenuW(
         menu,
@@ -1524,7 +1984,12 @@ unsafe fn show_menu(hwnd: HWND) {
         menu,
         MF_STRING,
         ID_OPEN_CONFIG,
-        wide(t(lang, "Open config", "Abrir config")).as_ptr(),
+        wide(t(
+            lang,
+            "Advanced config file",
+            "Archivo de config avanzado",
+        ))
+        .as_ptr(),
     );
     AppendMenuW(
         menu,
@@ -1542,327 +2007,18 @@ unsafe fn show_menu(hwnd: HWND) {
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
-    DestroyMenu(menu);
-}
-
-unsafe fn show_cycle_dialog(parent: HWND) {
-    let instance = GetModuleHandleW(null());
-    let class = wide("CodexSavingsCycleDialog");
-    let wc = WNDCLASSW {
-        lpfnWndProc: Some(cycle_dialog_proc),
-        hInstance: instance,
-        lpszClassName: class.as_ptr(),
-        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hIcon: app_icon(),
-        style: CS_DROPSHADOW,
-        ..zeroed()
-    };
-    RegisterClassW(&wc);
-
-    let dpi = dpi(parent);
-    let w = z(dpi, DIALOG_W);
-    let h = z(dpi, DIALOG_H);
-    let mut pt = POINT { x: 0, y: 0 };
-    GetCursorPos(&mut pt);
-    let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..zeroed()
-    };
-    GetMonitorInfoW(monitor, &mut info);
-    let x = (pt.x - w / 2).clamp(info.rcWork.left, info.rcWork.right - w);
-    let y = anchored_popup_y(
+    TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_WORKAREA,
+        pt.x,
         pt.y,
-        h,
-        info.rcWork.top,
-        info.rcWork.bottom,
-        z(dpi, POPUP_GAP),
-    );
-
-    let config = load_config();
-    CYCLE_DIALOG_DAY.store(config.cycle_day.clamp(1, 31), Ordering::Relaxed);
-    let lang = current_lang(&config);
-    let hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        class.as_ptr(),
-        wide(t(lang, "Plan start date", "Fecha de inicio del plan")).as_ptr(),
-        WS_POPUP,
-        x,
-        y,
-        w,
-        h,
-        parent,
-        null_mut(),
-        instance,
+        0,
+        hwnd,
         null(),
     );
-    if hwnd.is_null() {
-        return;
-    }
-    apply_window_visuals(hwnd, w, h);
-    ShowWindow(hwnd, SW_SHOW);
-    SetForegroundWindow(hwnd);
-}
-
-unsafe extern "system" fn cycle_dialog_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_PAINT => {
-            paint_cycle_dialog(hwnd);
-            0
-        }
-        WM_LBUTTONUP => {
-            let dpi = dpi(hwnd);
-            let x = unscale(dpi, (lparam & 0xffff) as i16 as i32);
-            let y = unscale(dpi, ((lparam >> 16) & 0xffff) as i16 as i32);
-            if point_in_rect(x, y, [292, 16, 22, 22]) {
-                DestroyWindow(hwnd);
-                return 0;
-            }
-            if point_in_rect(x, y, [158, 340, 74, 30]) {
-                save_cycle_dialog(hwnd);
-                return 0;
-            }
-            if point_in_rect(x, y, [240, 340, 74, 30]) {
-                DestroyWindow(hwnd);
-                return 0;
-            }
-            if let Some(day) = cycle_dialog_day_at(x, y) {
-                CYCLE_DIALOG_DAY.store(day, Ordering::Relaxed);
-                InvalidateRect(hwnd, null(), 1);
-            }
-            0
-        }
-        WM_KEYDOWN => {
-            match wparam as u32 {
-                VK_ESCAPE_CODE => {
-                    DestroyWindow(hwnd);
-                }
-                VK_RETURN_CODE => save_cycle_dialog(hwnd),
-                _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
-            }
-            0
-        }
-        WM_SETTINGCHANGE | WM_THEMECHANGED => {
-            apply_window_visuals(hwnd, scale(hwnd, DIALOG_W), scale(hwnd, DIALOG_H));
-            InvalidateRect(hwnd, null(), 1);
-            0
-        }
-        WM_CLOSE => {
-            DestroyWindow(hwnd);
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-unsafe fn save_cycle_dialog(hwnd: HWND) {
-    let day = CYCLE_DIALOG_DAY.load(Ordering::Relaxed).clamp(1, 31);
-    set_cycle_day(day);
-    let parent = GetWindow(hwnd, GW_OWNER);
-    if !parent.is_null() {
-        refresh(parent);
-    }
-    DestroyWindow(hwnd);
-}
-
-fn cycle_dialog_day_at(x: i32, y: i32) -> Option<u16> {
-    let start_x = 22;
-    let start_y = 144;
-    let cell_w = 38;
-    let cell_h = 30;
-    let gap = 4;
-    for day in 1..=31 {
-        let index = day - 1;
-        let col = index % 7;
-        let row = index / 7;
-        let rect = [
-            start_x + col * (cell_w + gap),
-            start_y + row * (cell_h + gap),
-            cell_w,
-            cell_h,
-        ];
-        if point_in_rect(x, y, rect) {
-            return Some(day as u16);
-        }
-    }
-    None
-}
-
-unsafe fn paint_cycle_dialog(hwnd: HWND) {
-    let config = load_config();
-    let lang = current_lang(&config);
-    let theme = system_theme();
-    let selected = CYCLE_DIALOG_DAY.load(Ordering::Relaxed).clamp(1, 31);
-    let today = date_from_system(local_time());
-    let next_reset = next_cycle_start(today, selected);
-    let dpi = dpi(hwnd);
-    let mut ps = zeroed();
-    let hdc = BeginPaint(hwnd, &mut ps);
-    let ui = Ui { hdc, dpi };
-    let mut rect = zeroed();
-    GetClientRect(hwnd, &mut rect);
-
-    fill(hdc, rect, solid_from_argb(theme.bg));
-    round_frame_argb(
-        ui,
-        [1, 1, DIALOG_W - 2, DIALOG_H - 2],
-        WINDOW_RADIUS,
-        theme.border_argb,
-    );
-    SetBkMode(hdc, TRANSPARENT as i32);
-    SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
-
-    draw_font(
-        ui,
-        t(lang, "Plan start date", "Fecha de inicio"),
-        [22, 18, 224, 24],
-        theme.text,
-        18,
-        700,
-    );
-    draw(
-        ui,
-        t(
-            lang,
-            "Choose the recurring monthly anchor.",
-            "Elige el día recurrente de cada mes.",
-        ),
-        [22, 45, 270, 20],
-        theme.muted,
-    );
-
-    dialog_close(ui, theme);
-    card(ui, theme, [20, 78, 290, 50], true);
-    draw_font(
-        ui,
-        &format!("{} {}", t(lang, "Day", "Día"), selected),
-        [36, 88, 78, 24],
-        theme.text,
-        18,
-        700,
-    );
-    draw(
-        ui,
-        t(lang, "Repeats monthly", "Se repite cada mes"),
-        [118, 91, 172, 18],
-        theme.muted,
-    );
-    draw(
-        ui,
-        &format!(
-            "{} {}",
-            t(lang, "Next reset", "Próximo reinicio"),
-            format_date(next_reset)
-        ),
-        [118, 108, 172, 18],
-        theme.subtle,
-    );
-
-    draw(
-        ui,
-        t(lang, "Start day", "Día de inicio"),
-        [24, 132, 120, 18],
-        theme.subtle,
-    );
-    for day in 1..=31 {
-        dialog_day_cell(ui, theme, day as u16, selected);
-    }
-
-    draw(
-        ui,
-        t(
-            lang,
-            "Short months use their last day.",
-            "Meses cortos usan su último día.",
-        ),
-        [24, 316, 284, 18],
-        theme.subtle,
-    );
-    dialog_button(
-        ui,
-        theme,
-        [158, 340, 74, 30],
-        t(lang, "Save", "Guardar"),
-        true,
-    );
-    dialog_button(
-        ui,
-        theme,
-        [240, 340, 74, 30],
-        t(lang, "Cancel", "Cancelar"),
-        false,
-    );
-
-    EndPaint(hwnd, &ps);
-}
-
-unsafe fn dialog_close(ui: Ui, theme: Theme) {
-    round_fill_argb(ui, [292, 16, 22, 22], CONTROL_RADIUS, theme.card_alt);
-    draw_center(ui, "x", [292, 18, 22, 18], theme.muted);
-}
-
-unsafe fn dialog_day_cell(ui: Ui, theme: Theme, day: u16, selected: u16) {
-    let index = day as i32 - 1;
-    let col = index % 7;
-    let row = index / 7;
-    let rect = [22 + col * 42, 144 + row * 34, 38, 30];
-    if day == selected {
-        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.accent_argb);
-        draw_font_center(
-            ui,
-            &day.to_string(),
-            [rect[0], rect[1] + 6, rect[2], 18],
-            rgb(255, 255, 255),
-            13,
-            700,
-        );
-    } else {
-        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.card);
-        round_frame_argb(ui, rect, CONTROL_RADIUS, theme.border_argb);
-        draw_font_center(
-            ui,
-            &day.to_string(),
-            [rect[0], rect[1] + 6, rect[2], 18],
-            theme.text,
-            13,
-            600,
-        );
-    }
-}
-
-unsafe fn dialog_button(ui: Ui, theme: Theme, rect: [i32; 4], label: &str, primary: bool) {
-    if primary {
-        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.accent_argb);
-        draw_font_center(
-            ui,
-            label,
-            [rect[0], rect[1] + 7, rect[2], 18],
-            rgb(255, 255, 255),
-            12,
-            700,
-        );
-    } else {
-        round_fill_argb(ui, rect, CONTROL_RADIUS, theme.card_alt);
-        round_frame_argb(ui, rect, CONTROL_RADIUS, theme.border_argb);
-        draw_font_center(
-            ui,
-            label,
-            [rect[0], rect[1] + 7, rect[2], 18],
-            theme.text,
-            12,
-            600,
-        );
-    }
-}
-
-fn point_in_rect(x: i32, y: i32, rect: [i32; 4]) -> bool {
-    x >= rect[0] && x < rect[0] + rect[2] && y >= rect[1] && y < rect[1] + rect[3]
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    focus_tray_icon(hwnd);
+    DestroyMenu(menu);
 }
 
 fn unscale(dpi: i32, value: i32) -> i32 {
@@ -1886,19 +2042,13 @@ unsafe fn paint(hwnd: HWND) {
     GetClientRect(hwnd, &mut rect);
 
     fill(hdc, rect, solid_from_argb(theme.bg));
-    round_frame_argb(
-        ui,
-        [1, 1, POPUP_W - 2, POPUP_H - 2],
-        WINDOW_RADIUS,
-        theme.border_argb,
-    );
     SetBkMode(hdc, TRANSPARENT as i32);
     SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
 
     draw_font_fit(
         ui,
-        plan_name(plan, lang),
-        [CONTENT_PAD, CONTENT_PAD, 210, 30],
+        &format!("Codex · {}", plan_name(plan, lang)),
+        [CONTENT_PAD, CONTENT_PAD, 216, 30],
         theme.text,
         20,
         15,
@@ -1907,8 +2057,16 @@ unsafe fn paint(hwnd: HWND) {
     draw_right(
         ui,
         &cycle_days_header_text(lang, snap.cycle_days_left),
-        [218, CONTENT_PAD + 7, 150, 18],
+        [224, CONTENT_PAD + 7, 118, 18],
         theme.subtle,
+    );
+    draw_font_center(
+        ui,
+        "⋯",
+        [348, CONTENT_PAD - 2, 24, 24],
+        theme.muted,
+        18,
+        600,
     );
 
     let pct = if plan_usd > 0.0 {
@@ -1916,93 +2074,102 @@ unsafe fn paint(hwnd: HWND) {
     } else {
         0.0
     };
-    let pct_label = if plan_usd > 0.0 && pct > 1.0 {
-        format!("+{:.0}%", (pct - 1.0) * 100.0)
-    } else if plan_usd > 0.0 {
+    let pct_label = if plan_usd > 0.0 {
         format!("{:.0}%", pct * 100.0)
     } else {
         "--".to_string()
     };
 
-    ring(ui, [30, 72, 114, 114], pct, theme);
-    draw_font_center_fit(ui, &pct_label, [44, 106, 86, 34], theme.text, 30, 16, 650);
-    draw_center(ui, t(lang, "used", "usado"), [54, 140, 66, 20], theme.muted);
+    ring(ui, [34, 78, 104, 104], pct, theme);
+    draw_font_center_fit(ui, &pct_label, [45, 108, 82, 30], theme.text, 27, 15, 650);
+    draw_center(
+        ui,
+        t(lang, "recovered", "recuperado"),
+        [47, 138, 78, 20],
+        theme.muted,
+    );
 
     let month_cost = money(snap.month.cost);
-    if plan_usd > 0.0 {
-        let limit = format!("/ {}", money(plan_usd));
-        let limit_w = font_text_width(ui, &limit, 12, 400);
-        let month_w = (368 - 170 - limit_w - 8).max(62);
-        let month_font = fitted_font_size(ui, &month_cost, month_w, 24, 15, 700);
-        draw_font(
-            ui,
-            &month_cost,
-            [170, 78, month_w, 34],
-            theme.text,
-            month_font,
-            700,
-        );
-        let rendered_month_w = font_text_width(ui, &month_cost, month_font, 700);
-        let limit_x = (170 + rendered_month_w + 8).min(368 - limit_w);
-        draw_font(
-            ui,
-            &limit,
-            [limit_x, 92, 368 - limit_x, 18],
-            theme.muted,
-            12,
-            400,
-        );
-    } else {
-        draw_font_fit(ui, &month_cost, [170, 78, 116, 34], theme.text, 24, 15, 700);
-        draw(ui, plan_limit(plan, lang), [170, 114, 190, 20], theme.muted);
-    }
-    draw_font_fit(
+    draw_font_fit(ui, &month_cost, [166, 78, 202, 34], theme.text, 25, 15, 700);
+    draw(
         ui,
-        &format!("{} {}", t(lang, "today", "hoy"), money(snap.today.cost)),
-        [170, 120, 190, 20],
-        theme.text,
-        13,
-        10,
-        400,
+        t(lang, "API-equivalent value", "valor API equivalente"),
+        [166, 110, 202, 18],
+        theme.muted,
     );
-    if plan_usd > 0.0 && snap.month.cost > plan_usd {
+
+    if plan_usd > 0.0 && snap.month.cost >= plan_usd {
         draw_font_fit(
             ui,
             &format!(
                 "{} {}",
-                t(lang, "over", "exceso"),
-                money(snap.month.cost - plan_usd)
+                money(snap.month.cost - plan_usd),
+                t(lang, "saved this cycle", "ahorrados este ciclo")
             ),
-            [170, 142, 190, 18],
-            theme.danger,
+            [166, 136, 202, 20],
+            theme.success,
             13,
             10,
-            400,
+            600,
         );
     } else if plan_usd > 0.0 {
-        let remaining = (plan_usd - snap.month.cost).max(0.0);
         draw_font_fit(
             ui,
-            &format!("{} {}", money(remaining), t(lang, "remaining", "restante")),
-            [170, 142, 190, 18],
-            theme.subtle,
+            &format!(
+                "{} {}",
+                money(plan_usd - snap.month.cost),
+                t(lang, "to break even", "para amortizar")
+            ),
+            [166, 136, 202, 20],
+            solid_from_argb(theme.accent_argb),
             13,
             10,
+            600,
+        );
+    } else {
+        draw_font_fit(
+            ui,
+            plan_limit(plan, lang),
+            [166, 136, 202, 20],
+            theme.subtle,
+            12,
+            9,
             400,
         );
     }
+    draw_font_fit(
+        ui,
+        &format!("{} · {}", t(lang, "Today", "Hoy"), money(snap.today.cost)),
+        [166, 160, 202, 20],
+        theme.muted,
+        12,
+        10,
+        400,
+    );
 
     let footer_y = POPUP_H - CONTENT_PAD - 18;
     if let Some(error) = &snap.error {
         draw(ui, error, [CONTENT_PAD, footer_y, 210, 18], theme.danger);
-    } else {
-        draw_right(
+    } else if !snap.unknown_models.is_empty() {
+        draw(
             ui,
-            &format!("{} {}", t(lang, "updated", "actualizado"), snap.updated),
-            [214, footer_y, 154, 18],
-            theme.subtle,
+            &format!(
+                "{} {}",
+                snap.unknown_models.len(),
+                t(lang, "models without price", "modelos sin precio")
+            ),
+            [CONTENT_PAD, footer_y, 204, 18],
+            theme.warning,
         );
     }
+    let status = if ALL_TIME_REFRESHING.load(Ordering::Relaxed) {
+        t(lang, "calculating total…", "calculando total…").to_string()
+    } else if REFRESHING.load(Ordering::Relaxed) {
+        t(lang, "updating…", "actualizando…").to_string()
+    } else {
+        format!("{} {}", t(lang, "updated", "actualizado"), snap.updated)
+    };
+    draw_right(ui, &status, [218, footer_y, 150, 18], theme.subtle);
 
     EndPaint(hwnd, &ps);
 }
@@ -2013,20 +2180,12 @@ unsafe fn fill(hdc: HDC, rect: RECT, color: COLORREF) {
     DeleteObject(brush);
 }
 
-unsafe fn card(ui: Ui, theme: Theme, rect: [i32; 4], alt: bool) {
-    let fill = if alt { theme.card_alt } else { theme.card };
-    if !round_fill_argb(ui, rect, CONTROL_RADIUS, fill) {
-        round_fill(ui, rect, CONTROL_RADIUS, solid_from_argb(fill));
-    }
-    round_frame_argb(ui, rect, CONTROL_RADIUS, theme.border_argb);
-}
-
 unsafe fn ring(ui: Ui, rect: [i32; 4], pct: f64, theme: Theme) {
     draw_arc(ui, rect, 12, 0.0, 360.0, colorref_to_argb(255, theme.track));
     let sweep = 360.0 * pct.clamp(0.0, 1.0) as f32;
     if sweep > 0.0 {
-        let color = if pct > 1.0 {
-            colorref_to_argb(255, theme.danger)
+        let color = if pct >= 1.0 {
+            colorref_to_argb(255, theme.success)
         } else {
             theme.accent_argb
         };
@@ -2058,58 +2217,6 @@ unsafe fn draw_arc(ui: Ui, rect: [i32; 4], width: i32, start: f32, sweep: f32, c
     });
 }
 
-unsafe fn round_fill(ui: Ui, rect: [i32; 4], radius: i32, color: COLORREF) {
-    if round_fill_argb(ui, rect, radius, colorref_to_argb(255, color)) {
-        return;
-    }
-    let [x, y, w, h] = rect.map(|v| z(ui.dpi, v));
-    let region = round_region(ui, [x, y, w, h], radius);
-    let brush = CreateSolidBrush(color);
-    FillRgn(ui.hdc, region, brush);
-    DeleteObject(brush);
-    DeleteObject(region);
-}
-
-unsafe fn round_region(ui: Ui, rect: [i32; 4], radius: i32) -> HRGN {
-    let [x, y, w, h] = rect;
-    let r = z(ui.dpi, radius * 2);
-    CreateRoundRectRgn(x, y, x + w, y + h, r, r)
-}
-
-unsafe fn round_fill_argb(ui: Ui, rect: [i32; 4], radius: i32, color: u32) -> bool {
-    with_gdiplus(ui.hdc, |graphics| {
-        let Some(path) = rounded_path(ui.dpi, rect, radius, false) else {
-            return false;
-        };
-        let mut brush: *mut GpSolidFill = null_mut();
-        let ok = GdipCreateSolidFill(color, &mut brush) == GdipOk
-            && !brush.is_null()
-            && GdipFillPath(graphics, brush as *mut GpBrush, path) == GdipOk;
-        if !brush.is_null() {
-            GdipDeleteBrush(brush as *mut GpBrush);
-        }
-        GdipDeletePath(path);
-        ok
-    })
-}
-
-unsafe fn round_frame_argb(ui: Ui, rect: [i32; 4], radius: i32, color: u32) -> bool {
-    with_gdiplus(ui.hdc, |graphics| {
-        let Some(path) = rounded_path(ui.dpi, rect, radius, true) else {
-            return false;
-        };
-        let mut pen: *mut GpPen = null_mut();
-        let ok = GdipCreatePen1(color, zf(ui.dpi, 1), UnitPixel, &mut pen) == GdipOk
-            && !pen.is_null()
-            && GdipDrawPath(graphics, pen, path) == GdipOk;
-        if !pen.is_null() {
-            GdipDeletePen(pen);
-        }
-        GdipDeletePath(path);
-        ok
-    })
-}
-
 unsafe fn with_gdiplus<F>(hdc: HDC, draw: F) -> bool
 where
     F: FnOnce(*mut GpGraphics) -> bool,
@@ -2125,56 +2232,6 @@ where
     let ok = draw(graphics);
     GdipDeleteGraphics(graphics);
     ok
-}
-
-unsafe fn rounded_path(dpi: i32, rect: [i32; 4], radius: i32, stroke: bool) -> Option<*mut GpPath> {
-    let [x, y, w, h] = rect;
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    let inset = if stroke { 0.5 } else { 0.0 };
-    let x = zf(dpi, x) + inset;
-    let y = zf(dpi, y) + inset;
-    let w = (zf(dpi, w) - inset * 2.0).max(0.0);
-    let h = (zf(dpi, h) - inset * 2.0).max(0.0);
-    if w <= 0.0 || h <= 0.0 {
-        return None;
-    }
-    let r = zf(dpi, radius).min(w / 2.0).min(h / 2.0).max(0.0);
-    let d = r * 2.0;
-
-    let mut path: *mut GpPath = null_mut();
-    if GdipCreatePath(FillModeWinding, &mut path) != GdipOk || path.is_null() {
-        return None;
-    }
-    if r <= 0.0 {
-        let ok = GdipAddPathLine(path, x, y, x + w, y) == GdipOk
-            && GdipAddPathLine(path, x + w, y, x + w, y + h) == GdipOk
-            && GdipAddPathLine(path, x + w, y + h, x, y + h) == GdipOk
-            && GdipAddPathLine(path, x, y + h, x, y) == GdipOk
-            && GdipClosePathFigure(path) == GdipOk;
-        if ok {
-            return Some(path);
-        }
-        GdipDeletePath(path);
-        return None;
-    }
-
-    let ok = GdipAddPathArc(path, x, y, d, d, 180.0, 90.0) == GdipOk
-        && GdipAddPathLine(path, x + r, y, x + w - r, y) == GdipOk
-        && GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0) == GdipOk
-        && GdipAddPathLine(path, x + w, y + r, x + w, y + h - r) == GdipOk
-        && GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0) == GdipOk
-        && GdipAddPathLine(path, x + w - r, y + h, x + r, y + h) == GdipOk
-        && GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0) == GdipOk
-        && GdipAddPathLine(path, x, y + h - r, x, y + r) == GdipOk
-        && GdipClosePathFigure(path) == GdipOk;
-    if ok {
-        Some(path)
-    } else {
-        GdipDeletePath(path);
-        None
-    }
 }
 
 unsafe fn draw(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
@@ -2223,10 +2280,6 @@ unsafe fn draw_center(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF) {
         color,
         DT_CENTER,
     );
-}
-
-unsafe fn draw_font(ui: Ui, text: &str, rect: [i32; 4], color: COLORREF, size: i32, weight: i32) {
-    draw_font_aligned(ui, text, rect, color, size, weight, DT_LEFT);
 }
 
 unsafe fn draw_font_fit(
@@ -2445,6 +2498,49 @@ fn windows_apps_dark() -> bool {
     personalize_dword("AppsUseLightTheme", 1) == 0
 }
 
+fn windows_system_dark() -> bool {
+    personalize_dword("SystemUsesLightTheme", 1) == 0
+}
+
+unsafe fn enable_native_dark_menus() {
+    let library = LoadLibraryExW(
+        wide("uxtheme.dll").as_ptr(),
+        null_mut(),
+        LOAD_LIBRARY_SEARCH_SYSTEM32,
+    );
+    if library.is_null() {
+        return;
+    }
+
+    // ponytail: uxtheme ordinals are the smallest native-menu fix; replace
+    // with custom menus if Windows stops exporting them.
+    if let Some(proc) = GetProcAddress(library, std::ptr::without_provenance::<u8>(135)) {
+        let set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32 =
+            std::mem::transmute(proc);
+        set_preferred_app_mode(if windows_apps_dark() || windows_system_dark() {
+            2
+        } else {
+            3
+        });
+    }
+    if let Some(proc) = GetProcAddress(library, std::ptr::without_provenance::<u8>(136)) {
+        let flush_menu_themes: unsafe extern "system" fn() = std::mem::transmute(proc);
+        flush_menu_themes();
+    }
+    FreeLibrary(library);
+}
+
+unsafe fn cached_themed_tray_icon(dark: bool) -> Option<HICON> {
+    let icons = THEMED_TRAY_ICONS.get_or_init(|| {
+        [
+            themed_tray_icon(false).unwrap_or(null_mut()) as usize,
+            themed_tray_icon(true).unwrap_or(null_mut()) as usize,
+        ]
+    });
+    let icon = icons[usize::from(dark)] as HICON;
+    (!icon.is_null()).then_some(icon)
+}
+
 unsafe fn themed_tray_icon(dark: bool) -> Option<HICON> {
     let size = 32i32;
     let source_icon = app_icon_sized(size);
@@ -2632,14 +2728,38 @@ fn set_plan(id: &str) {
         return;
     }
     let mut config = load_config();
+    let current_amount = plan_usd(&config);
     config.plan = id.to_string();
-    config.monthly_usd_override = None;
+    config.monthly_usd_override = (id == "custom").then_some(
+        config
+            .monthly_usd_override
+            .unwrap_or(current_amount.max(20.0)),
+    );
     write_config(&config);
 }
 
 fn set_cycle_day(day: u16) {
     let mut config = load_config();
     config.cycle_day = day.clamp(1, 31);
+    write_config(&config);
+}
+
+fn set_language(language: &str) {
+    if !matches!(language, "auto" | "en" | "es") {
+        return;
+    }
+    let mut config = load_config();
+    config.language = language.to_string();
+    write_config(&config);
+}
+
+fn adjust_custom_amount(delta: f64) {
+    let mut config = load_config();
+    let amount = config
+        .monthly_usd_override
+        .unwrap_or_else(|| plan_usd(&config));
+    config.plan = "custom".to_string();
+    config.monthly_usd_override = Some((amount + delta).clamp(0.0, 1_000_000.0));
     write_config(&config);
 }
 
@@ -2721,13 +2841,37 @@ fn dpi(hwnd: HWND) -> i32 {
     }
 }
 
-fn scale(hwnd: HWND, value: i32) -> i32 {
-    z(dpi(hwnd), value)
-}
-
 fn anchored_popup_y(cursor_y: i32, popup_h: i32, work_top: i32, work_bottom: i32, gap: i32) -> i32 {
     let max_y = (work_bottom - popup_h - gap).max(work_top);
     (cursor_y - popup_h - gap).clamp(work_top, max_y)
+}
+
+fn clamp_popup_origin(x: i32, y: i32, w: i32, h: i32, work: RECT, gap: i32) -> (i32, i32) {
+    (
+        x.clamp(work.left, (work.right - w).max(work.left)),
+        y.clamp(work.top, (work.bottom - h - gap).max(work.top)),
+    )
+}
+
+fn popup_animation_flags(anchor: POINT, work: RECT) -> (u32, u32) {
+    let distances = [
+        (anchor.y - work.bottom).abs(),
+        (anchor.y - work.top).abs(),
+        (anchor.x - work.right).abs(),
+        (anchor.x - work.left).abs(),
+    ];
+    match distances
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(edge, _)| edge)
+        .unwrap_or(0)
+    {
+        0 => (AW_VER_NEGATIVE, AW_VER_POSITIVE),
+        1 => (AW_VER_POSITIVE, AW_VER_NEGATIVE),
+        2 => (AW_HOR_NEGATIVE, AW_HOR_POSITIVE),
+        _ => (AW_HOR_POSITIVE, AW_HOR_NEGATIVE),
+    }
 }
 
 unsafe fn gdiplus_startup() -> Option<usize> {
@@ -2906,11 +3050,68 @@ mod tests {
         .to_string()
     }
 
+    fn turn_context_line(model: &str) -> String {
+        serde_json::json!({
+            "type": "turn_context",
+            "payload": { "model": model }
+        })
+        .to_string()
+    }
+
     #[test]
     fn price_uses_longest_matching_model_prefix() {
         let price = price_for_model("gpt-5.4-mini-2026-04-28").unwrap();
         assert_eq!(price.input, 0.75);
         assert_eq!(price.output, 4.5);
+
+        let terra = price_for_model("gpt-5.6-terra-2026-07-01").unwrap();
+        assert_eq!(terra.input, 2.5);
+        assert_eq!(terra.cached, 0.25);
+        assert_eq!(terra.output, 15.0);
+    }
+
+    #[test]
+    fn gpt_5_6_prices_cache_writes_and_long_context() {
+        let mut unknown = HashSet::new();
+        let short = Usage {
+            input: 100_000,
+            cached: 0,
+            cache_write: 0,
+            output: 0,
+            reasoning: 0,
+            total: 100_000,
+        };
+        assert_eq!(
+            cost(short, "gpt-5.6-luna", ServiceTier::Standard, &mut unknown),
+            0.1
+        );
+
+        let cache_write = Usage {
+            input: 100_000,
+            cache_write: 100_000,
+            ..Usage::default()
+        };
+        assert_eq!(
+            cost(
+                cache_write,
+                "gpt-5.6-sol",
+                ServiceTier::Standard,
+                &mut unknown
+            ),
+            0.625
+        );
+
+        let long = Usage {
+            input: 272_001,
+            output: 100_000,
+            total: 372_001,
+            ..Usage::default()
+        };
+        assert_eq!(
+            cost(long, "gpt-5.6-terra", ServiceTier::Standard, &mut unknown),
+            3.610005
+        );
+        assert!(unknown.is_empty());
     }
 
     #[test]
@@ -2918,6 +3119,7 @@ mod tests {
         let usage = Usage {
             input: 1_000_000,
             cached: 0,
+            cache_write: 0,
             output: 0,
             reasoning: 0,
             total: 1_000_000,
@@ -2926,13 +3128,16 @@ mod tests {
 
         assert_eq!(
             cost(usage, "gpt-5.5", ServiceTier::Standard, &mut unknown),
-            5.0
+            10.0
         );
         assert_eq!(
             cost(usage, "gpt-5.5", ServiceTier::Fast, &mut unknown),
-            12.5
+            25.0
         );
-        assert_eq!(cost(usage, "gpt-5.4", ServiceTier::Fast, &mut unknown), 5.0);
+        assert_eq!(
+            cost(usage, "gpt-5.4", ServiceTier::Fast, &mut unknown),
+            10.0
+        );
         assert_eq!(
             cost(usage, "gpt-5.4-mini", ServiceTier::Fast, &mut unknown),
             0.75
@@ -2945,6 +3150,7 @@ mod tests {
         let current = Usage {
             input: 12,
             cached: 2,
+            cache_write: 0,
             output: 5,
             reasoning: 1,
             total: 17,
@@ -2952,6 +3158,7 @@ mod tests {
         let previous = Usage {
             input: 10,
             cached: 3,
+            cache_write: 0,
             output: 1,
             reasoning: 2,
             total: 14,
@@ -3017,6 +3224,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_prices_each_turn_with_its_recorded_model() {
+        let contents = [
+            turn_context_line("gpt-5.6-sol"),
+            usage_line(100_000, 0, 0, 0, 100_000),
+            turn_context_line("gpt-5.6-luna"),
+            usage_line(200_000, 0, 0, 0, 200_000),
+        ]
+        .join("\n");
+        let path = temp_jsonl(&contents);
+        let mut unknown = HashSet::new();
+        let period = parse_session(&path, "gpt-5.5", ServiceTier::Standard, &mut unknown).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(period.cost, 0.6);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_session_ignores_non_billable_total_only_events() {
+        let path = temp_jsonl(
+            &serde_json::json!({
+                "type": "token_count",
+                "total_token_usage": {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 116_457,
+                }
+            })
+            .to_string(),
+        );
+        let mut unknown = HashSet::new();
+        let period = parse_session(&path, "gpt-5.6-sol", ServiceTier::Standard, &mut unknown);
+        fs::remove_file(path).unwrap();
+
+        assert!(period.is_none());
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
     fn parse_session_uses_event_service_tier_before_default() {
         let line = serde_json::json!({
             "type": "event_msg",
@@ -3040,7 +3288,7 @@ mod tests {
         let period = parse_session(&path, "gpt-5.5", ServiceTier::Standard, &mut unknown).unwrap();
         fs::remove_file(path).unwrap();
 
-        assert_eq!(period.cost, 12.5);
+        assert_eq!(period.cost, 25.0);
         assert!(unknown.is_empty());
     }
 
@@ -3068,7 +3316,7 @@ mod tests {
         let period = parse_session(&path, "gpt-5.5", ServiceTier::Fast, &mut unknown).unwrap();
         fs::remove_file(path).unwrap();
 
-        assert_eq!(period.cost, 5.0);
+        assert_eq!(period.cost, 10.0);
         assert!(unknown.is_empty());
     }
 
@@ -3102,7 +3350,39 @@ mod tests {
 
         assert_eq!(period.calls, 1);
         assert_eq!(period.usage.input, 500_000);
-        assert_eq!(period.cost, 2.5);
+        assert_eq!(period.cost, 5.0);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_session_current_builds_cycle_and_today_in_one_pass() {
+        let contents = [
+            usage_line_at("2026-07-08T12:00:00.000Z", 100, 0, 0, 0, 100),
+            usage_line_at("2026-07-09T12:00:00.000Z", 200, 0, 0, 0, 200),
+        ]
+        .join("\n");
+        let path = temp_jsonl(&contents);
+        let mut unknown = HashSet::new();
+        let (cycle, today) = parse_session_current(
+            &path,
+            "gpt-5.6-sol",
+            ServiceTier::Standard,
+            DateKey {
+                year: 2026,
+                month: 7,
+                day: 6,
+            },
+            DateKey {
+                year: 2026,
+                month: 7,
+                day: 9,
+            },
+            &mut unknown,
+        );
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(cycle.unwrap().usage.input, 200);
+        assert_eq!(today.unwrap().usage.input, 100);
         assert!(unknown.is_empty());
     }
 
@@ -3113,6 +3393,7 @@ mod tests {
             Usage {
                 input: 1_500_000,
                 cached: 0,
+                cache_write: 0,
                 output: 0,
                 reasoning: 0,
                 total: 1_500_000,
@@ -3120,6 +3401,7 @@ mod tests {
             Usage {
                 input: 500_000,
                 cached: 0,
+                cache_write: 0,
                 output: 0,
                 reasoning: 0,
                 total: 500_000,
@@ -3148,7 +3430,7 @@ mod tests {
 
         assert_eq!(period.calls, 1);
         assert_eq!(period.usage.input, 500_000);
-        assert_eq!(period.cost, 2.5);
+        assert_eq!(period.cost, 5.0);
         assert!(unknown.is_empty());
     }
 
@@ -3170,8 +3452,18 @@ mod tests {
         let contents = r#"
             model = "gpt-5.5"
             service_tier = "fast"
+            [features]
+            fast_mode = true
         "#;
         assert_eq!(service_tier_from_toml(contents), Some(ServiceTier::Fast));
+    }
+
+    #[test]
+    fn service_tier_from_toml_requires_fast_feature_flag() {
+        assert_eq!(
+            service_tier_from_toml("service_tier = \"fast\""),
+            Some(ServiceTier::Standard)
+        );
     }
 
     #[test]
@@ -3346,9 +3638,9 @@ mod tests {
     fn official_plan_ranges_are_available_locally() {
         let plus = plan_by_id("plus").unwrap();
         let pro = plan_by_id("pro_20x").unwrap();
-        assert!(plus.limits_en.contains("15-80"));
-        assert!(pro.limits_en.contains("300-1600"));
-        assert!(CREDIT_RATES.contains("125/12.5/750"));
+        assert!(plus.limits_en.contains("Sol 15-90"));
+        assert!(pro.limits_en.contains("Sol 300-1800"));
+        assert!(CREDIT_RATES.contains("Terra 62.5/6.25/375"));
     }
 
     #[test]
@@ -3366,6 +3658,34 @@ mod tests {
     #[test]
     fn anchored_popup_y_clamps_to_work_area_top_when_tight() {
         assert_eq!(anchored_popup_y(40, 420, 20, 300, 12), 20);
+    }
+
+    #[test]
+    fn popup_origin_stays_above_taskbar() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1032,
+        };
+        assert_eq!(
+            clamp_popup_origin(1600, 900, 392, 226, work, 12),
+            (1528, 794)
+        );
+    }
+
+    #[test]
+    fn popup_animation_enters_from_nearest_taskbar_edge() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1032,
+        };
+        assert_eq!(
+            popup_animation_flags(POINT { x: 1800, y: 1060 }, work),
+            (AW_VER_NEGATIVE, AW_VER_POSITIVE)
+        );
     }
 
     #[test]
