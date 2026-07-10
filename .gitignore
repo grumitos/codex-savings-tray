@@ -4,4 +4,6 @@
 /dist/
 /ui/**/bin/
 /ui/**/obj/
+/ui/**/AppPackages/
+/ui/**/BundleArtifacts/
 codex-savings-current.csv
