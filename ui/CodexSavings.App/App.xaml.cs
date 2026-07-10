@@ -581,6 +581,7 @@ internal sealed class SettingsWindow : Window
     private bool _loading = true;
     private bool _allowClose;
     private bool _dialogOpen;
+    private int _previewGeneration;
     private AppWindow? _appWindow;
 
     public SettingsWindow(CoreBridge core, SnapshotDto? snapshot, UiStrings strings, Action<ConfigDto> saved)
@@ -664,7 +665,7 @@ internal sealed class SettingsWindow : Window
         _snapshot = snapshot;
         _codexHome.Text = snapshot.CodexHome;
         _tier.Text = snapshot.ServiceTier;
-        if (!_loading && !string.IsNullOrWhiteSpace(snapshot.CycleNext))
+        if (!_loading && !HasChanges() && !string.IsNullOrWhiteSpace(snapshot.CycleNext))
             _nextReset.Text = _strings.Format("CurrentNextResetFormat", snapshot.CycleNext);
     }
     private async Task LoadAsync()
@@ -708,6 +709,18 @@ internal sealed class SettingsWindow : Window
         _amountSection.Visibility = choice.Plan.Id == "custom" ? Visibility.Visible : Visibility.Collapsed;
         var config = CurrentConfig();
         _save.IsEnabled = config is not null && config != _initial;
+        var generation = ++_previewGeneration;
+        if (config is not null) _ = UpdatePreviewAsync(config, generation);
+    }
+
+    private async Task UpdatePreviewAsync(ConfigDto config, int generation)
+    {
+        var reply = await _core.PreviewCycleAsync(config);
+        if (generation != _previewGeneration || !reply.Ok || reply.Data is null) return;
+        _nextReset.Text = _strings.Format(
+            "NextResetPreviewFormat",
+            reply.Data.CycleNext,
+            reply.Data.DaysUntilReset);
     }
 
     private ConfigDto? CurrentConfig() =>

@@ -22,6 +22,7 @@
   <data name="ShortMonths" xml:space="preserve"><value>For short months, the last available day is used.</value></data>
   <data name="NextResetPending" xml:space="preserve"><value>The next reset will be calculated after saving.</value></data>
   <data name="CurrentNextResetFormat" xml:space="preserve"><value>Current next reset: {0}</value></data>
+  <data name="NextResetPreviewFormat" xml:space="preserve"><value>Next reset: {0} ({1} days)</value></data>
   <data name="Language" xml:space="preserve"><value>Language</value></data>
   <data name="DataAdvanced" xml:space="preserve"><value>Data and advanced</value></data>
   <data name="PricingTier" xml:space="preserve"><value>Pricing tier</value></data>

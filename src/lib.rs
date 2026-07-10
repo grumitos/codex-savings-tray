@@ -1284,6 +1284,16 @@ fn config_from_ffi_json(input: &str) -> Result<Config, FfiError> {
     })
 }
 
+unsafe fn config_from_ffi_pointer(json: *const c_char) -> Result<Config, FfiError> {
+    if json.is_null() {
+        return Err(("invalid_json", "Settings JSON is required.".to_string()));
+    }
+    let input = unsafe { CStr::from_ptr(json) }
+        .to_str()
+        .map_err(|_| ("invalid_json", "Settings must be UTF-8 JSON.".to_string()))?;
+    config_from_ffi_json(input)
+}
+
 fn config_json(config: &Config) -> Value {
     serde_json::json!({
         "plan": config.plan,
@@ -1340,6 +1350,14 @@ fn settings_json(config: &Config) -> Value {
     })
 }
 
+fn cycle_preview_json(config: &Config, today: DateKey) -> Value {
+    let cycle_next = next_cycle_start(today, config.cycle_day);
+    serde_json::json!({
+        "cycleNext": format_date(cycle_next),
+        "daysUntilReset": days_between(today, cycle_next).max(0),
+    })
+}
+
 fn cst_json(value: Value) -> *mut c_char {
     CString::new(value.to_string())
         .expect("JSON cannot contain an interior NUL")
@@ -1391,6 +1409,21 @@ pub extern "C" fn cst_load_settings() -> *mut c_char {
 }
 
 #[no_mangle]
+/// Validates UTF-8 JSON settings and previews their next cycle without persisting them.
+///
+/// # Safety
+///
+/// `json` must be null or point to a NUL-terminated UTF-8 byte sequence that is
+/// readable for the duration of this call.
+pub unsafe extern "C" fn cst_preview_cycle(json: *const c_char) -> *mut c_char {
+    ffi_call(|| {
+        let config = unsafe { config_from_ffi_pointer(json) }?;
+        let today = date_from_system(local_time());
+        Ok(cycle_preview_json(&config, today))
+    })
+}
+
+#[no_mangle]
 /// Validates and persists UTF-8 JSON settings from a caller-owned C string.
 ///
 /// # Safety
@@ -1399,13 +1432,7 @@ pub extern "C" fn cst_load_settings() -> *mut c_char {
 /// readable for the duration of this call.
 pub unsafe extern "C" fn cst_save_settings(json: *const c_char) -> *mut c_char {
     ffi_call(|| {
-        if json.is_null() {
-            return Err(("invalid_json", "Settings JSON is required.".to_string()));
-        }
-        let input = unsafe { CStr::from_ptr(json) }
-            .to_str()
-            .map_err(|_| ("invalid_json", "Settings must be UTF-8 JSON.".to_string()))?;
-        let config = config_from_ffi_json(input)?;
+        let config = unsafe { config_from_ffi_pointer(json) }?;
         save_config(&config).map_err(|message| ("save_failed", message))?;
         Ok(config_json(&config))
     })
@@ -2174,6 +2201,24 @@ mod tests {
             .0,
             "invalid_cycle_day"
         );
+    }
+
+    #[test]
+    fn cycle_preview_uses_the_rust_month_clamping_rules() {
+        let config = Config {
+            cycle_day: 31,
+            ..Config::default()
+        };
+        let preview = cycle_preview_json(
+            &config,
+            DateKey {
+                year: 2026,
+                month: 4,
+                day: 10,
+            },
+        );
+        assert_eq!(preview["cycleNext"], "2026-04-30");
+        assert_eq!(preview["daysUntilReset"], 20);
     }
 
     #[test]

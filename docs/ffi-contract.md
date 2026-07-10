@@ -9,6 +9,7 @@ is a UTF-8 JSON string allocated by Rust and must be released exactly once with
 | `cst_scan_current` | none | current-cycle SnapshotDto |
 | `cst_scan_all_time` | none | SnapshotDto including allTime |
 | `cst_load_settings` | none | normalized ConfigDto and plans |
+| `cst_preview_cycle` | UTF-8 ConfigDto JSON | next cycle date and days remaining, without persistence |
 | `cst_save_settings` | UTF-8 ConfigDto JSON | normalized ConfigDto |
 | `cst_free_string` | a prior result pointer | none |
 
