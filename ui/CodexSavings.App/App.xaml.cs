@@ -24,7 +24,9 @@ public partial class DesktopApp : Application
     private QuickActionsWindow? _quickActions;
     private SettingsWindow? _settings;
     private IReadOnlyList<PlanDto> _plans = [];
+    private UiStrings? _strings;
     private bool _disposed;
+    private UiStrings Strings => _strings ??= new UiStrings("auto");
 
     public DesktopApp()
     {
@@ -43,6 +45,7 @@ public partial class DesktopApp : Application
         _refresh.SnapshotChanged += snapshot => dispatcher.TryEnqueue(() =>
         {
             _summary?.Update(snapshot);
+            _settings?.UpdateSnapshot(snapshot);
             _tray?.SetTooltip(SnapshotPresentation.Tooltip(snapshot, _plans));
         });
         _refresh.Failed += error => dispatcher.TryEnqueue(() => _summary?.ShowError(error));
@@ -51,7 +54,11 @@ public partial class DesktopApp : Application
         _tray.LeftClicked += ToggleSummaryFromTray;
         _tray.RightClicked += ShowQuickActions;
         var catalog = await _core.LoadSettingsAsync();
-        if (catalog.Ok && catalog.Data is not null) _plans = catalog.Data.Plans;
+        if (catalog.Ok && catalog.Data is not null)
+        {
+            _plans = catalog.Data.Plans;
+            _strings = new UiStrings(catalog.Data.Config.Language);
+        }
         await _refresh.StartAsync();
         if (showAfterLaunch) ShowSummary();
     }
@@ -81,7 +88,7 @@ public partial class DesktopApp : Application
     private async Task TransitionSummaryAsync(int generation, bool show)
     {
         if (_disposed) return;
-        _summary ??= new SummaryWindow(_refresh!, _plans, OnSummaryDeactivated, ShowSettings);
+        _summary ??= new SummaryWindow(_refresh!, _plans, Strings, OnSummaryDeactivated, ShowSettings);
         var completed = show
             ? await _summary.ShowAsync(_tray?.GetIconRect(), _uiSettings.AnimationsEnabled)
             : await _summary.HideAsync(_uiSettings.AnimationsEnabled);
@@ -101,6 +108,7 @@ public partial class DesktopApp : Application
         _quickActions?.Close();
         QuickActionsWindow? quickActions = null;
         quickActions = new QuickActionsWindow(
+            Strings,
             ToggleSummary,
             () => _ = _refresh!.RefreshAsync(),
             () => _ = _refresh!.CalculateAllTimeAsync(),
@@ -116,7 +124,13 @@ public partial class DesktopApp : Application
     {
         await HideSummaryAsync();
         if (_settings is not null) { _settings.Present(); return; }
-        var settings = new SettingsWindow(_core, () => _ = _refresh!.RefreshAsync());
+        var settings = new SettingsWindow(_core, _refresh!.LastSnapshot, Strings, savedConfig =>
+        {
+            _strings = new UiStrings(savedConfig.Language);
+            _summary?.Close();
+            _summary = null;
+            _ = _refresh.RefreshAsync();
+        });
         settings.Closed += (_, _) => { if (ReferenceEquals(_settings, settings)) _settings = null; };
         _settings = settings;
         settings.Present();
@@ -159,6 +173,7 @@ internal sealed class SummaryWindow : Window
     private const int AnimationOffsetEpx = 10;
     private readonly RefreshCoordinator _refresh;
     private readonly IReadOnlyList<PlanDto> _plans;
+    private readonly UiStrings _strings;
     private readonly Action _deactivated;
     private readonly Border _root = new() { Width = WidthEpx, Height = HeightEpx, CornerRadius = new CornerRadius(12) };
     private readonly TranslateTransform _translation = new();
@@ -193,12 +208,13 @@ internal sealed class SummaryWindow : Window
     private FlyoutPoint _hideOffset;
     private bool _isShown;
 
-    public SummaryWindow(RefreshCoordinator refresh, IReadOnlyList<PlanDto> plans, Action deactivated, Action openSettings)
+    public SummaryWindow(RefreshCoordinator refresh, IReadOnlyList<PlanDto> plans, UiStrings strings, Action deactivated, Action openSettings)
     {
         _refresh = refresh;
         _plans = plans;
+        _strings = strings;
         _deactivated = deactivated;
-        Title = "Codex Savings";
+        Title = strings["AppTitle"];
         SystemBackdrop = new DesktopAcrylicBackdrop();
         ExtendsContentIntoTitleBar = true;
         Activated += (_, eventArgs) =>
@@ -209,9 +225,9 @@ internal sealed class SummaryWindow : Window
         stats.ColumnDefinitions.Add(new ColumnDefinition());
         stats.ColumnDefinitions.Add(new ColumnDefinition());
         stats.ColumnDefinitions.Add(new ColumnDefinition());
-        stats.Children.Add(Stat("Today", _today, 0));
-        stats.Children.Add(Stat("Until reset", _days, 1));
-        stats.Children.Add(Stat("All time", _allTime, 2));
+        stats.Children.Add(Stat(strings["Today"], _today, 0));
+        stats.Children.Add(Stat(strings["UntilReset"], _days, 1));
+        stats.Children.Add(Stat(strings["AllTime"], _allTime, 2));
         var settingsButton = new Button
         {
             Content = new FontIcon { Glyph = "\uE713", FontSize = 15 },
@@ -220,10 +236,10 @@ internal sealed class SummaryWindow : Window
             Padding = new Thickness(0),
             HorizontalAlignment = HorizontalAlignment.Right,
         };
-        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(settingsButton, "Settings");
-        ToolTipService.SetToolTip(settingsButton, "Settings");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(settingsButton, strings["Settings"]);
+        ToolTipService.SetToolTip(settingsButton, strings["Settings"]);
         settingsButton.Click += (_, _) => openSettings();
-        _error.ActionButton = new Button { Content = "Retry" }.Also(button => button.Click += async (_, _) => await RefreshAsync());
+        _error.ActionButton = new Button { Content = strings["Retry"] }.Also(button => button.Click += async (_, _) => await RefreshAsync());
         _allTime.Click += async (_, _) =>
         {
             if (_refresh.LastSnapshot?.AllTime is null) await CalculateAllTimeAsync();
@@ -235,7 +251,7 @@ internal sealed class SummaryWindow : Window
         header.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center, Children =
         {
             new Image { Source = new BitmapImage(new Uri("ms-appx:///Assets/app.png")), Width = 22, Height = 22 },
-            new TextBlock { Text = "Codex Savings", FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center },
+            new TextBlock { Text = strings["AppTitle"], FontSize = 18, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center },
             Chip(_plan), Chip(_tier),
         }});
         Grid.SetColumn(settingsButton, 2);
@@ -258,7 +274,7 @@ internal sealed class SummaryWindow : Window
                 new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right, Children =
                 {
                     _busy,
-                    new Button { Content = "Refresh" }.Also(button => button.Click += async (_, _) => await RefreshAsync()),
+                    new Button { Content = strings["Refresh"] }.Also(button => button.Click += async (_, _) => await RefreshAsync()),
                 }},
             }},
         }};
@@ -279,11 +295,11 @@ internal sealed class SummaryWindow : Window
         _context.Text = SnapshotPresentation.Context(snapshot, _plans);
         _today.Text = "$" + snapshot.Today.CostUsd.ToString("F2");
         _days.Text = snapshot.DaysUntilReset.ToString();
-        _allTime.Content = snapshot.AllTime is null ? "Calculate" : "$" + snapshot.AllTime.CostUsd.ToString("F2");
-        _updated.Text = "Updated " + snapshot.UpdatedAt;
+        _allTime.Content = snapshot.AllTime is null ? _strings["Calculate"] : "$" + snapshot.AllTime.CostUsd.ToString("F2");
+        _updated.Text = _strings.Format("UpdatedFormat", snapshot.UpdatedAt);
         _error.IsOpen = false;
         var warning = SnapshotPresentation.Warning(snapshot);
-        _warning.Title = SnapshotPresentation.UsesSpanish(snapshot.Config) ? "Revisar estimacion" : "Review estimate";
+        _warning.Title = _strings["ReviewEstimate"];
         _warning.Message = warning ?? string.Empty;
         _warning.IsOpen = warning is not null;
         _context.Visibility = warning is null ? Visibility.Visible : Visibility.Collapsed;
@@ -448,6 +464,7 @@ internal sealed class QuickActionsWindow : Window
     private bool _closing;
 
     public QuickActionsWindow(
+        UiStrings strings,
         Action summary,
         Action refresh,
         Action allTime,
@@ -456,10 +473,10 @@ internal sealed class QuickActionsWindow : Window
         Action exit,
         Action closed)
     {
-        Title = "Codex Savings actions";
+        Title = strings["ActionsTitle"];
         SystemBackdrop = new DesktopAcrylicBackdrop();
         ExtendsContentIntoTitleBar = true;
-        _firstButton = Button("Show summary", summary);
+        _firstButton = Button(strings["ShowSummary"], summary);
         var root = new StackPanel
         {
             Width = WidthEpx,
@@ -469,11 +486,11 @@ internal sealed class QuickActionsWindow : Window
             Children =
             {
                 _firstButton,
-                Button("Refresh", refresh),
-                Button("Calculate all-time total", allTime),
-                Button("Settings", settings),
-                Button("Open usage dashboard", usage),
-                Button("Exit", exit),
+                Button(strings["Refresh"], refresh),
+                Button(strings["CalculateAllTime"], allTime),
+                Button(strings["Settings"], settings),
+                Button(strings["OpenUsage"], usage),
+                Button(strings["Exit"], exit),
             },
         };
         root.KeyDown += (_, eventArgs) =>
@@ -533,44 +550,278 @@ internal sealed class QuickActionsWindow : Window
 
 internal sealed class SettingsWindow : Window
 {
-    private readonly CoreBridge _core; private readonly Action _saved;
-    private readonly ComboBox _plans = new(); private readonly NumberBox _amount = new() { Minimum = 0, Maximum = 1_000_000 };
-    private readonly NumberBox _day = new() { Minimum = 1, Maximum = 31 }; private readonly ComboBox _language = new() { ItemsSource = new[] { "auto", "en", "es" } };
-    private ConfigDto? _initial;
-    public SettingsWindow(CoreBridge core, Action saved)
+    private readonly CoreBridge _core;
+    private SnapshotDto? _snapshot;
+    private readonly UiStrings _strings;
+    private readonly Action<ConfigDto> _saved;
+    private readonly ComboBox _plans = new() { HorizontalAlignment = HorizontalAlignment.Stretch, DisplayMemberPath = nameof(PlanChoice.Display) };
+    private readonly TextBlock _planDetails = new() { Opacity = .72, TextWrapping = TextWrapping.Wrap };
+    private readonly NumberBox _amount = new()
     {
-        _core = core; _saved = saved; SystemBackdrop = new MicaBackdrop(); Title = "Codex Savings settings";
-        Content = new StackPanel { Padding = new Thickness(24), Spacing = 12, Children =
+        Minimum = 0,
+        Maximum = 1_000_000,
+        SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+    };
+    private readonly StackPanel _amountSection;
+    private readonly NumberBox _day = new()
+    {
+        Minimum = 1,
+        Maximum = 31,
+        SmallChange = 1,
+        SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+    };
+    private readonly TextBlock _nextReset = new() { Opacity = .72 };
+    private readonly TextBox _codexHome = new() { IsReadOnly = true, TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _tier = new() { Text = "standard", Opacity = .72 };
+    private readonly ComboBox _language = new() { HorizontalAlignment = HorizontalAlignment.Stretch, DisplayMemberPath = nameof(LanguageChoice.Display) };
+    private readonly Button _save = new() { IsEnabled = false };
+    private readonly InfoBar _error = new() { IsOpen = false, IsClosable = true, Severity = InfoBarSeverity.Error };
+    private readonly Grid _root = new();
+    private ConfigDto? _initial;
+    private bool _loading = true;
+    private bool _allowClose;
+    private bool _dialogOpen;
+    private AppWindow? _appWindow;
+
+    public SettingsWindow(CoreBridge core, SnapshotDto? snapshot, UiStrings strings, Action<ConfigDto> saved)
+    {
+        _core = core;
+        _snapshot = snapshot;
+        _strings = strings;
+        _saved = saved;
+        SystemBackdrop = new MicaBackdrop();
+        Title = strings["SettingsTitle"];
+        _save.Content = strings["Save"];
+        _amountSection = new StackPanel { Spacing = 6, Children =
         {
-            new TextBlock { Text = "Subscription" }, _plans, new TextBlock { Text = "Custom monthly amount (USD)" }, _amount,
-            new TextBlock { Text = "Cycle day (1–31)" }, _day, new TextBlock { Text = "Language" }, _language,
-            new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children =
-            { new Button { Content = "Save" }.Also(button => button.Click += async (_, _) => await SaveAsync()), new Button { Content = "Cancel" }.Also(button => button.Click += (_, _) => Close()) }},
+            Label(strings["CustomAmount"]), _amount,
         }};
+        var form = new StackPanel { Padding = new Thickness(24, 20, 24, 16), Spacing = 10, Children =
+        {
+            Heading(strings["Subscription"]), _plans, _planDetails, _amountSection,
+            Heading(strings["BillingCycle"]), Label(strings["CycleDay"]), _day,
+            new TextBlock { Text = strings["ShortMonths"], Opacity = .72, TextWrapping = TextWrapping.Wrap },
+            _nextReset,
+            Heading(strings["Language"]), _language,
+            Heading(strings["DataAdvanced"]),
+            Label("CODEX_HOME"),
+            _codexHome,
+            Label(strings["PricingTier"]),
+            _tier,
+            new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children =
+            {
+                new Button { Content = strings["OpenConfig"] }.Also(button => button.Click += (_, _) => OpenConfig()),
+                new Button { Content = strings["OpenUsage"] }.Also(button => button.Click += (_, _) => OpenUsage()),
+            }},
+            _error,
+        }};
+        var cancel = new Button { Content = strings["Cancel"] };
+        cancel.Click += async (_, _) => await RequestCloseAsync();
+        _save.Click += async (_, _) => await SaveAsync();
+        var footer = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Spacing = 8,
+            Padding = new Thickness(24, 12, 24, 18),
+            Children = { _save, cancel },
+        };
+        _root.RowDefinitions.Add(new RowDefinition());
+        _root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _root.Children.Add(new ScrollViewer { Content = form, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
+        Grid.SetRow(footer, 1);
+        _root.Children.Add(footer);
+        _root.KeyDown += async (_, eventArgs) =>
+        {
+            if (eventArgs.Key != Windows.System.VirtualKey.Escape) return;
+            eventArgs.Handled = true;
+            await RequestCloseAsync();
+        };
+        Content = _root;
+
+        _plans.SelectionChanged += (_, _) => UpdateState();
+        _amount.ValueChanged += (_, _) => UpdateState();
+        _day.ValueChanged += (_, _) => UpdateState();
+        _language.SelectionChanged += (_, _) => UpdateState();
+        if (snapshot is not null) UpdateSnapshot(snapshot);
         _ = LoadAsync();
     }
     public void Present()
     {
         var window = WinRT.Interop.WindowNative.GetWindowHandle(this);
-        var appWindow = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(window));
+        _appWindow ??= AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(window));
+        _appWindow.Closing -= OnClosing;
+        _appWindow.Closing += OnClosing;
         var scale = FlyoutWindowNative.GetDpi(window) / 96d;
-        appWindow.Resize(new SizeInt32(
+        _appWindow.Resize(new SizeInt32(
             (int)Math.Round(520 * scale, MidpointRounding.AwayFromZero),
             (int)Math.Round(600 * scale, MidpointRounding.AwayFromZero)));
         Activate();
     }
+
+    public void UpdateSnapshot(SnapshotDto snapshot)
+    {
+        _snapshot = snapshot;
+        _codexHome.Text = snapshot.CodexHome;
+        _tier.Text = snapshot.ServiceTier;
+        if (!_loading && !string.IsNullOrWhiteSpace(snapshot.CycleNext))
+            _nextReset.Text = _strings.Format("CurrentNextResetFormat", snapshot.CycleNext);
+    }
     private async Task LoadAsync()
     {
-        var reply = await _core.LoadSettingsAsync(); if (!reply.Ok || reply.Data is null) return;
-        _initial = reply.Data.Config; _plans.ItemsSource = reply.Data.Plans; _plans.DisplayMemberPath = nameof(PlanDto.NameEn);
-        _plans.SelectedItem = reply.Data.Plans.First(plan => plan.Id == _initial.Plan); _amount.Value = _initial.MonthlyUsdOverride ?? 0; _day.Value = _initial.CycleDay; _language.SelectedItem = _initial.Language;
+        var reply = await _core.LoadSettingsAsync();
+        if (!reply.Ok || reply.Data is null)
+        {
+            ShowError(reply.Error ?? new CoreError("settings_error", _strings["SettingsLoadError"]));
+            return;
+        }
+
+        _initial = reply.Data.Config;
+        var spanish = SnapshotPresentation.UsesSpanish(_initial);
+        var plans = reply.Data.Plans.Select(plan => new PlanChoice(
+            plan,
+            (spanish ? plan.NameEs : plan.NameEn) + (plan.Usd > 0 ? " — " + _strings.Format("PerMonthFormat", plan.Usd.ToString("F0")) : string.Empty))).ToArray();
+        var languages = new[]
+        {
+            new LanguageChoice("auto", _strings["Automatic"]),
+            new LanguageChoice("en", _strings["English"]),
+            new LanguageChoice("es", _strings["Spanish"]),
+        };
+        _plans.ItemsSource = plans;
+        _plans.SelectedItem = plans.First(choice => choice.Plan.Id == _initial.Plan);
+        _amount.Value = _initial.MonthlyUsdOverride ?? 0;
+        _day.Value = _initial.CycleDay;
+        _language.ItemsSource = languages;
+        _language.SelectedItem = languages.First(choice => choice.Id == _initial.Language);
+        _nextReset.Text = string.IsNullOrWhiteSpace(_snapshot?.CycleNext)
+            ? _strings["NextResetPending"]
+            : _strings.Format("CurrentNextResetFormat", _snapshot.CycleNext);
+        _loading = false;
+        UpdateState();
     }
+
+    private void UpdateState()
+    {
+        if (_loading || _plans.SelectedItem is not PlanChoice choice) return;
+        var spanish = _initial is not null && SnapshotPresentation.UsesSpanish(_initial);
+        _planDetails.Text = spanish ? choice.Plan.LimitsEs : choice.Plan.LimitsEn;
+        _amountSection.Visibility = choice.Plan.Id == "custom" ? Visibility.Visible : Visibility.Collapsed;
+        var config = CurrentConfig();
+        _save.IsEnabled = config is not null && config != _initial;
+    }
+
+    private ConfigDto? CurrentConfig() =>
+        _plans.SelectedItem is PlanChoice plan && _language.SelectedItem is LanguageChoice language
+            ? SettingsValidator.TryCreate(plan.Plan.Id, _amount.Value, language.Id, _day.Value)
+            : null;
+
     private async Task SaveAsync()
     {
-        if (_plans.SelectedItem is not PlanDto plan || _initial is null) return;
-        var config = new ConfigDto(plan.Id, plan.Id == "custom" ? _amount.Value : null, _language.SelectedItem?.ToString() ?? "auto", (ushort)_day.Value);
-        if (!SettingsValidator.IsValid(config)) return;
-        var reply = await _core.SaveSettingsAsync(config); if (reply.Ok) { _saved(); Close(); }
+        var config = CurrentConfig();
+        if (config is null || config == _initial) return;
+        _save.IsEnabled = false;
+        _error.IsOpen = false;
+        var reply = await _core.SaveSettingsAsync(config);
+        if (reply.Ok && reply.Data is not null)
+        {
+            _initial = reply.Data;
+            _allowClose = true;
+            _saved(reply.Data);
+            Close();
+            return;
+        }
+        ShowError(reply.Error ?? new CoreError("settings_error", _strings["SettingsSaveError"]));
+        UpdateState();
     }
+
+    private void OnClosing(AppWindow sender, AppWindowClosingEventArgs eventArgs)
+    {
+        if (_allowClose || !HasChanges()) return;
+        eventArgs.Cancel = true;
+        _ = ConfirmDiscardAsync();
+    }
+
+    private async Task RequestCloseAsync()
+    {
+        if (!HasChanges())
+        {
+            _allowClose = true;
+            Close();
+            return;
+        }
+        await ConfirmDiscardAsync();
+    }
+
+    private async Task ConfirmDiscardAsync()
+    {
+        if (_dialogOpen) return;
+        _dialogOpen = true;
+        try
+        {
+            var dialog = new ContentDialog
+            {
+                XamlRoot = _root.XamlRoot,
+                Title = _strings["DiscardTitle"],
+                Content = _strings["DiscardMessage"],
+                PrimaryButtonText = _strings["Discard"],
+                CloseButtonText = _strings["KeepEditing"],
+                DefaultButton = ContentDialogButton.Close,
+            };
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+            _allowClose = true;
+            Close();
+        }
+        finally { _dialogOpen = false; }
+    }
+
+    private bool HasChanges() => !_loading && CurrentConfig() != _initial;
+
+    private void OpenConfig()
+    {
+        var path = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "Codex Savings Tracker",
+            "config.json");
+        Open(path, "config_missing", _strings["ConfigMissing"]);
+    }
+
+    private void OpenUsage() => Open(
+        "https://chatgpt.com/codex/cloud/settings/analytics",
+        "usage_error",
+        _strings["UsageError"]);
+
+    private void Open(string target, string code, string message)
+    {
+        try
+        {
+            if (!target.StartsWith("https://", StringComparison.Ordinal) && !File.Exists(target))
+            {
+                ShowError(new CoreError(code, message));
+                return;
+            }
+            Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+        }
+        catch { ShowError(new CoreError(code, message)); }
+    }
+
+    private void ShowError(CoreError error)
+    {
+        _error.Title = error.Code;
+        _error.Message = error.Message;
+        _error.IsOpen = true;
+    }
+
+    private static TextBlock Heading(string text) => new()
+    {
+        Text = text,
+        FontSize = 18,
+        FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+        Margin = new Thickness(0, 8, 0, 0),
+    };
+
+    private static TextBlock Label(string text) => new() { Text = text };
+
+    private sealed record PlanChoice(PlanDto Plan, string Display);
+    private sealed record LanguageChoice(string Id, string Display);
 }
 internal static class ControlExtensions { internal static T Also<T>(this T control, Action<T> configure) where T : Control { configure(control); return control; } }

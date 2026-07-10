@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <data name="AppTitle" xml:space="preserve"><value>Codex Savings</value></data>
+  <data name="SettingsTitle" xml:space="preserve"><value>Codex Savings settings</value></data>
+  <data name="ActionsTitle" xml:space="preserve"><value>Codex Savings actions</value></data>
+  <data name="Settings" xml:space="preserve"><value>Settings</value></data>
+  <data name="Refresh" xml:space="preserve"><value>Refresh</value></data>
+  <data name="Retry" xml:space="preserve"><value>Retry</value></data>
+  <data name="Today" xml:space="preserve"><value>Today</value></data>
+  <data name="UntilReset" xml:space="preserve"><value>Until reset</value></data>
+  <data name="AllTime" xml:space="preserve"><value>All time</value></data>
+  <data name="Calculate" xml:space="preserve"><value>Calculate</value></data>
+  <data name="UpdatedFormat" xml:space="preserve"><value>Updated {0}</value></data>
+  <data name="ShowSummary" xml:space="preserve"><value>Show summary</value></data>
+  <data name="CalculateAllTime" xml:space="preserve"><value>Calculate all-time total</value></data>
+  <data name="OpenUsage" xml:space="preserve"><value>Open usage dashboard</value></data>
+  <data name="Exit" xml:space="preserve"><value>Exit</value></data>
+  <data name="Subscription" xml:space="preserve"><value>Subscription</value></data>
+  <data name="CustomAmount" xml:space="preserve"><value>Custom monthly amount (USD)</value></data>
+  <data name="BillingCycle" xml:space="preserve"><value>Billing cycle</value></data>
+  <data name="CycleDay" xml:space="preserve"><value>Cycle day (1–31)</value></data>
+  <data name="ShortMonths" xml:space="preserve"><value>For short months, the last available day is used.</value></data>
+  <data name="NextResetPending" xml:space="preserve"><value>The next reset will be calculated after saving.</value></data>
+  <data name="CurrentNextResetFormat" xml:space="preserve"><value>Current next reset: {0}</value></data>
+  <data name="Language" xml:space="preserve"><value>Language</value></data>
+  <data name="DataAdvanced" xml:space="preserve"><value>Data and advanced</value></data>
+  <data name="PricingTier" xml:space="preserve"><value>Pricing tier</value></data>
+  <data name="OpenConfig" xml:space="preserve"><value>Open config file</value></data>
+  <data name="Save" xml:space="preserve"><value>Save</value></data>
+  <data name="Cancel" xml:space="preserve"><value>Cancel</value></data>
+  <data name="Automatic" xml:space="preserve"><value>Automatic</value></data>
+  <data name="English" xml:space="preserve"><value>English</value></data>
+  <data name="Spanish" xml:space="preserve"><value>Spanish</value></data>
+  <data name="SettingsLoadError" xml:space="preserve"><value>Settings could not be loaded.</value></data>
+  <data name="SettingsSaveError" xml:space="preserve"><value>Settings could not be saved.</value></data>
+  <data name="DiscardTitle" xml:space="preserve"><value>Discard changes?</value></data>
+  <data name="DiscardMessage" xml:space="preserve"><value>Your unsaved settings will be lost.</value></data>
+  <data name="Discard" xml:space="preserve"><value>Discard</value></data>
+  <data name="KeepEditing" xml:space="preserve"><value>Keep editing</value></data>
+  <data name="ConfigMissing" xml:space="preserve"><value>The configuration file does not exist yet. Save settings first.</value></data>
+  <data name="UsageError" xml:space="preserve"><value>The usage dashboard could not be opened.</value></data>
+  <data name="ReviewEstimate" xml:space="preserve"><value>Review estimate</value></data>
+  <data name="PerMonthFormat" xml:space="preserve"><value>${0}/month</value></data>
+</root>

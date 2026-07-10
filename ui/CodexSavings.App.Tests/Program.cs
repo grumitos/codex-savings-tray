@@ -24,6 +24,10 @@ Assert(SettingsValidator.IsValid(new("custom", 0, "es", 31)), "custom boundary i
 Assert(!SettingsValidator.IsValid(new("custom", null, "es", 31)), "custom needs an amount");
 Assert(!SettingsValidator.IsValid(new("plus", null, "fr", 1)), "language is bounded");
 Assert(!SettingsValidator.IsValid(new("plus", null, "en", 32)), "cycle day is bounded");
+Assert(SettingsValidator.TryCreate("plus", 500, "en", 1) == new ConfigDto("plus", null, "en", 1), "fixed plans ignore the custom amount field");
+Assert(SettingsValidator.TryCreate("custom", 25, "es", 31) == new ConfigDto("custom", 25, "es", 31), "custom form values create a config");
+Assert(SettingsValidator.TryCreate("custom", double.NaN, "es", 1) is null, "empty custom amount is rejected");
+Assert(SettingsValidator.TryCreate("plus", 0, "en", 1.5) is null, "fractional cycle days are rejected");
 
 var work = new FlyoutRect(0, 0, 1920, 1040);
 Assert(FlyoutPlacement.Calculate(new(1800, 1040, 1840, 1080), work, 420, 300, 12) == new FlyoutPoint(1488, 728), "bottom taskbar anchors above the work area");
