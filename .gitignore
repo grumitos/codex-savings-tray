@@ -2,4 +2,6 @@
 /target-check/
 /target-verify/
 /dist/
+/ui/**/bin/
+/ui/**/obj/
 codex-savings-current.csv
