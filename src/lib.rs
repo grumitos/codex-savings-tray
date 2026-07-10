@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env,
+    ffi::{c_char, CStr, CString},
     fs::{self, File},
     io::{BufRead, BufReader},
     mem::zeroed,
@@ -14,7 +15,6 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{FILETIME, SYSTEMTIME},
-    Globalization::GetUserDefaultUILanguage,
     System::{
         SystemInformation::GetLocalTime,
         Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
@@ -67,12 +67,6 @@ const PRICES: &[(&str, Price)] = &[
     ("gpt-5.1", price(1.25, 0.125, 10.0)),
     ("gpt-5", price(1.25, 0.125, 10.0)),
 ];
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Lang {
-    En,
-    Es,
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ServiceTier {
@@ -1117,18 +1111,6 @@ fn format_date(date: DateKey) -> String {
     format!("{:04}-{:02}-{:02}", date.year, date.month, date.day)
 }
 
-fn cycle_days_header_text(lang: Lang, days_left: i32) -> String {
-    if days_left == 1 {
-        t(lang, "1 day left", "1 día restante").to_string()
-    } else {
-        format!(
-            "{} {}",
-            days_left.max(0),
-            t(lang, "days left", "días restantes")
-        )
-    }
-}
-
 fn local_time() -> SYSTEMTIME {
     unsafe {
         let mut time = zeroed();
@@ -1196,9 +1178,14 @@ fn config_from_json(value: Value) -> Config {
 }
 
 fn write_config(config: &Config) {
+    let _ = save_config(config);
+}
+
+fn save_config(config: &Config) -> Result<(), String> {
     let path = config_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create the settings directory: {error}"))?;
     }
     let monthly = config
         .monthly_usd_override
@@ -1211,10 +1198,9 @@ fn write_config(config: &Config) {
         "language": config.language.clone(),
         "cycle_day": config.cycle_day,
     });
-    let _ = fs::write(
-        path,
-        serde_json::to_string_pretty(&text).unwrap_or_default(),
-    );
+    let text = serde_json::to_string_pretty(&text)
+        .map_err(|error| format!("Could not serialize settings: {error}"))?;
+    fs::write(path, text).map_err(|error| format!("Could not save settings: {error}"))
 }
 
 fn config_path() -> PathBuf {
@@ -1224,46 +1210,6 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Codex Savings Tracker")
         .join("config.json")
-}
-
-fn set_plan(id: &str) {
-    if plan_by_id(id).is_none() {
-        return;
-    }
-    let mut config = load_config();
-    let current_amount = plan_usd(&config);
-    config.plan = id.to_string();
-    config.monthly_usd_override = (id == "custom").then_some(
-        config
-            .monthly_usd_override
-            .unwrap_or(current_amount.max(20.0)),
-    );
-    write_config(&config);
-}
-
-fn set_cycle_day(day: u16) {
-    let mut config = load_config();
-    config.cycle_day = day.clamp(1, 31);
-    write_config(&config);
-}
-
-fn set_language(language: &str) {
-    if !matches!(language, "auto" | "en" | "es") {
-        return;
-    }
-    let mut config = load_config();
-    config.language = language.to_string();
-    write_config(&config);
-}
-
-fn adjust_custom_amount(delta: f64) {
-    let mut config = load_config();
-    let amount = config
-        .monthly_usd_override
-        .unwrap_or_else(|| plan_usd(&config));
-    config.plan = "custom".to_string();
-    config.monthly_usd_override = Some((amount + delta).clamp(0.0, 1_000_000.0));
-    write_config(&config);
 }
 
 fn plan_by_id(id: &str) -> Option<&'static Plan> {
@@ -1280,51 +1226,202 @@ fn plan_usd(config: &Config) -> f64 {
         .unwrap_or_else(|| current_plan(config).usd)
 }
 
-fn current_lang(config: &Config) -> Lang {
-    match config.language.as_str() {
-        "en" => Lang::En,
-        "es" => Lang::Es,
-        _ => {
-            let primary = unsafe { GetUserDefaultUILanguage() } & 0x03ff;
-            if primary == 0x000a {
-                Lang::Es
-            } else {
-                Lang::En
-            }
+type FfiError = (&'static str, String);
+
+fn config_from_ffi_json(input: &str) -> Result<Config, FfiError> {
+    let value: Value = serde_json::from_str(input)
+        .map_err(|_| ("invalid_json", "Settings must be valid JSON.".to_string()))?;
+    let object = value.as_object().ok_or((
+        "invalid_settings",
+        "Settings must be a JSON object.".to_string(),
+    ))?;
+
+    let plan = object
+        .get("plan")
+        .and_then(Value::as_str)
+        .filter(|id| plan_by_id(id).is_some())
+        .ok_or(("invalid_plan", "Choose a supported plan.".to_string()))?;
+    let language = object
+        .get("language")
+        .and_then(Value::as_str)
+        .filter(|language| matches!(*language, "auto" | "en" | "es"))
+        .ok_or((
+            "invalid_language",
+            "Language must be auto, en, or es.".to_string(),
+        ))?;
+    let cycle_day = object
+        .get("cycleDay")
+        .and_then(Value::as_u64)
+        .filter(|day| (1..=31).contains(day))
+        .map(|day| day as u16)
+        .ok_or((
+            "invalid_cycle_day",
+            "Cycle day must be an integer from 1 to 31.".to_string(),
+        ))?;
+    let monthly_usd_override = match object.get("monthlyUsdOverride") {
+        None | Some(Value::Null) => None,
+        Some(value) => value
+            .as_f64()
+            .filter(|amount| amount.is_finite() && (0.0..=1_000_000.0).contains(amount))
+            .ok_or((
+                "invalid_amount",
+                "Custom amount must be between 0 and 1,000,000 USD.".to_string(),
+            ))
+            .map(Some)?,
+    };
+    if plan == "custom" && monthly_usd_override.is_none() {
+        return Err((
+            "invalid_amount",
+            "A custom plan requires a monthly amount.".to_string(),
+        ));
+    }
+
+    Ok(Config {
+        plan: plan.to_string(),
+        monthly_usd_override,
+        language: language.to_string(),
+        cycle_day,
+    })
+}
+
+fn config_json(config: &Config) -> Value {
+    serde_json::json!({
+        "plan": config.plan,
+        "monthlyUsdOverride": config.monthly_usd_override,
+        "language": config.language,
+        "cycleDay": config.cycle_day,
+    })
+}
+
+fn period_json(period: &Period) -> Value {
+    serde_json::json!({
+        "costUsd": period.cost,
+        "calls": period.calls,
+        "sessions": period.sessions,
+        "inputTokens": period.usage.input,
+        "cachedInputTokens": period.usage.cached,
+        "cacheWriteTokens": period.usage.cache_write,
+        "outputTokens": period.usage.output,
+        "reasoningOutputTokens": period.usage.reasoning,
+        "totalTokens": period.usage.total,
+    })
+}
+
+fn snapshot_json(snapshot: &Snapshot) -> Value {
+    serde_json::json!({
+        "cycle": period_json(&snapshot.month),
+        "today": period_json(&snapshot.today),
+        "allTime": snapshot.all_time.as_ref().map(period_json),
+        "config": config_json(&snapshot.config),
+        "serviceTier": service_tier_label(snapshot.service_tier),
+        "cycleStart": format_date(snapshot.cycle_start),
+        "cycleNext": format_date(snapshot.cycle_next),
+        "daysUntilReset": snapshot.cycle_days_left,
+        "updatedAt": snapshot.updated,
+        "allTimeUpdatedAt": snapshot.all_time_updated,
+        "codexHome": snapshot.codex_home,
+        "unknownModels": snapshot.unknown_models,
+        "assumedModels": snapshot.assumed_models,
+        "error": snapshot.error,
+    })
+}
+
+fn settings_json(config: &Config) -> Value {
+    serde_json::json!({
+        "config": config_json(config),
+        "plans": PLANS.iter().map(|plan| serde_json::json!({
+            "id": plan.id,
+            "nameEn": plan.en,
+            "nameEs": plan.es,
+            "usd": plan.usd,
+            "limitsEn": plan.limits_en,
+            "limitsEs": plan.limits_es,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn cst_json(value: Value) -> *mut c_char {
+    CString::new(value.to_string())
+        .expect("JSON cannot contain an interior NUL")
+        .into_raw()
+}
+
+fn cst_ok(data: Value) -> *mut c_char {
+    cst_json(serde_json::json!({ "ok": true, "data": data }))
+}
+
+fn cst_error(code: &'static str, message: impl Into<String>) -> *mut c_char {
+    cst_json(serde_json::json!({
+        "ok": false,
+        "error": { "code": code, "message": message.into() },
+    }))
+}
+
+fn ffi_call(call: impl FnOnce() -> Result<Value, FfiError>) -> *mut c_char {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(Ok(data)) => cst_ok(data),
+        Ok(Err((code, message))) => cst_error(code, message),
+        Err(_) => cst_error("internal_error", "The core could not complete the request."),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cst_scan_current() -> *mut c_char {
+    ffi_call(|| {
+        let config = load_config();
+        scan_month(&config)
+            .map(|snapshot| snapshot_json(&snapshot))
+            .map_err(|message| ("scan_failed", message))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn cst_scan_all_time() -> *mut c_char {
+    ffi_call(|| {
+        let config = load_config();
+        let mut snapshot = scan_month(&config).map_err(|message| ("scan_failed", message))?;
+        calculate_all_time(&mut snapshot);
+        Ok(snapshot_json(&snapshot))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn cst_load_settings() -> *mut c_char {
+    ffi_call(|| Ok(settings_json(&load_config())))
+}
+
+#[no_mangle]
+/// Validates and persists UTF-8 JSON settings from a caller-owned C string.
+///
+/// # Safety
+///
+/// `json` must be null or point to a NUL-terminated UTF-8 byte sequence that is
+/// readable for the duration of this call.
+pub unsafe extern "C" fn cst_save_settings(json: *const c_char) -> *mut c_char {
+    ffi_call(|| {
+        if json.is_null() {
+            return Err(("invalid_json", "Settings JSON is required.".to_string()));
         }
+        let input = unsafe { CStr::from_ptr(json) }
+            .to_str()
+            .map_err(|_| ("invalid_json", "Settings must be UTF-8 JSON.".to_string()))?;
+        let config = config_from_ffi_json(input)?;
+        save_config(&config).map_err(|message| ("save_failed", message))?;
+        Ok(config_json(&config))
+    })
+}
+
+#[no_mangle]
+/// Releases a string returned by this library.
+///
+/// # Safety
+///
+/// `pointer` must be null or an unmodified pointer returned by a `cst_*`
+/// function that has not already been released.
+pub unsafe extern "C" fn cst_free_string(pointer: *mut c_char) {
+    if !pointer.is_null() {
+        drop(unsafe { CString::from_raw(pointer) });
     }
-}
-
-fn plan_name(plan: &Plan, lang: Lang) -> &'static str {
-    t(lang, plan.en, plan.es)
-}
-
-fn plan_limit(plan: &Plan, lang: Lang) -> &'static str {
-    t(lang, plan.limits_en, plan.limits_es)
-}
-
-fn plan_menu_label(plan: &Plan, lang: Lang) -> String {
-    if plan.usd > 0.0 {
-        format!("{} ({}/mo)", plan_name(plan, lang), money(plan.usd))
-    } else {
-        plan_name(plan, lang).to_string()
-    }
-}
-
-fn t(lang: Lang, en: &'static str, es: &'static str) -> &'static str {
-    if lang == Lang::Es {
-        es
-    } else {
-        en
-    }
-}
-
-fn truncate_chars(value: &str, max: usize) -> String {
-    let mut out = String::new();
-    for ch in value.chars().take(max) {
-        out.push(ch);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1866,7 +1963,6 @@ mod tests {
         }));
         assert_eq!(current_plan(&config).id, "pro_20x");
         assert_eq!(plan_usd(&config), 199.0);
-        assert_eq!(current_lang(&config), Lang::Es);
         assert_eq!(config.cycle_day, 15);
     }
 
@@ -2034,13 +2130,61 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_truncation_keeps_char_boundary() {
-        assert_eq!(truncate_chars("abcdef", 3), "abc");
-        assert_eq!(truncate_chars("ahorro", 20), "ahorro");
+    fn all_time_is_on_demand_by_default() {
+        assert!(Snapshot::default().all_time.is_none());
     }
 
     #[test]
-    fn all_time_is_on_demand_by_default() {
-        assert!(Snapshot::default().all_time.is_none());
+    fn ffi_rejects_invalid_json() {
+        assert_eq!(config_from_ffi_json("{").err().unwrap().0, "invalid_json");
+    }
+
+    #[test]
+    fn ffi_rejects_unknown_plans() {
+        assert_eq!(
+            config_from_ffi_json(r#"{"plan":"unknown","language":"en","cycleDay":1}"#)
+                .err()
+                .unwrap()
+                .0,
+            "invalid_plan"
+        );
+    }
+
+    #[test]
+    fn ffi_rejects_out_of_range_values() {
+        assert_eq!(
+            config_from_ffi_json(
+                r#"{"plan":"custom","monthlyUsdOverride":1000000.01,"language":"en","cycleDay":31}"#
+            )
+            .err()
+            .unwrap()
+            .0,
+            "invalid_amount"
+        );
+    }
+
+    #[test]
+    fn ffi_rejects_invalid_cycle_days() {
+        assert_eq!(
+            config_from_ffi_json(
+                r#"{"plan":"plus","monthlyUsdOverride":null,"language":"en","cycleDay":32}"#
+            )
+            .err()
+            .unwrap()
+            .0,
+            "invalid_cycle_day"
+        );
+    }
+
+    #[test]
+    fn ffi_responses_are_owned_and_freed() {
+        let response = cst_ok(serde_json::json!({"value":"ok"}));
+        unsafe {
+            let json: Value =
+                serde_json::from_str(std::ffi::CStr::from_ptr(response).to_str().unwrap()).unwrap();
+            assert_eq!(json["ok"], true);
+            assert_eq!(json["data"]["value"], "ok");
+            cst_free_string(response);
+        }
     }
 }

@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "CodexSavings.App.Tests/1.0.0": {
+        "runtime": {
+          "CodexSavings.App.Tests.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "CodexSavings.App.Tests/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

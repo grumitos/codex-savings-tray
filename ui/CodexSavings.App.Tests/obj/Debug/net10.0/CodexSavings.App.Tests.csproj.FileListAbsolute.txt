@@ -1,0 +1,15 @@
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.GeneratedMSBuildEditorConfig.editorconfig
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.AssemblyInfoInputs.cache
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.AssemblyInfo.cs
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.csproj.CoreCompileInputs.cache
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.sourcelink.json
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\bin\Debug\net10.0\CodexSavings.App.Tests.exe
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\bin\Debug\net10.0\CodexSavings.App.Tests.deps.json
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\bin\Debug\net10.0\CodexSavings.App.Tests.runtimeconfig.json
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\bin\Debug\net10.0\CodexSavings.App.Tests.dll
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\bin\Debug\net10.0\CodexSavings.App.Tests.pdb
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.dll
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\refint\CodexSavings.App.Tests.dll
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.pdb
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\CodexSavings.App.Tests.genruntimeconfig.cache
+D:\Dev\codex-savings-tray\ui\CodexSavings.App.Tests\obj\Debug\net10.0\ref\CodexSavings.App.Tests.dll
