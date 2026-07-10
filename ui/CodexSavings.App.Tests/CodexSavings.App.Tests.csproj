@@ -10,6 +10,7 @@
     <Compile Include="..\CodexSavings.App\FlyoutVisibilityController.cs" Link="FlyoutVisibilityController.cs" />
     <Compile Include="..\CodexSavings.App\FlyoutPlacement.cs" Link="FlyoutPlacement.cs" />
     <Compile Include="..\CodexSavings.App\RefreshCoordinator.cs" Link="RefreshCoordinator.cs" />
+    <Compile Include="..\CodexSavings.App\SnapshotPresentation.cs" Link="SnapshotPresentation.cs" />
     <Compile Include="..\CodexSavings.App\SettingsValidator.cs" Link="SettingsValidator.cs" />
   </ItemGroup>
 </Project>

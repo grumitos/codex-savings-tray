@@ -44,3 +44,20 @@ var previous = new SnapshotDto(period, period, period, config, "standard", "", "
 var current = previous with { AllTime = null, AllTimeUpdatedAt = "" };
 var preserved = RefreshCoordinator.PreserveAllTime(current, previous);
 Assert(preserved.AllTime == period && preserved.AllTimeUpdatedAt == "history", "current refresh preserves calculated history");
+
+var plans = new[]
+{
+    new PlanDto("pro_5x", "Pro 5x", "Pro 5x", 100, "Pro limits", "Limites Pro"),
+    new PlanDto("free", "Free", "Gratis", 0, "Quick tasks", "Tareas rapidas"),
+};
+var presentationSnapshot = previous with
+{
+    Cycle = period with { CostUsd = 150 },
+    Config = new ConfigDto("pro_5x", null, "en", 1),
+    UnknownModels = ["mystery-model"],
+    AssumedModels = 2,
+};
+Assert(SnapshotPresentation.Tooltip(presentationSnapshot, plans).Contains("150%"), "tooltip includes the plan percentage");
+Assert(SnapshotPresentation.Tooltip(presentationSnapshot, plans).Contains("all time $10.00"), "tooltip includes calculated history");
+Assert(SnapshotPresentation.Warning(presentationSnapshot) is { } warning && warning.Contains("mystery-model") && warning.Contains("2 sessions"), "warning identifies unknown and assumed models");
+Assert(SnapshotPresentation.Context(presentationSnapshot with { Config = new ConfigDto("free", null, "en", 1) }, plans) == "Quick tasks", "amount-free plans show catalog limits");

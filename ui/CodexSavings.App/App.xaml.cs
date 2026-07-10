@@ -23,6 +23,7 @@ public partial class DesktopApp : Application
     private SummaryWindow? _summary;
     private QuickActionsWindow? _quickActions;
     private SettingsWindow? _settings;
+    private IReadOnlyList<PlanDto> _plans = [];
     private bool _disposed;
 
     public DesktopApp()
@@ -42,13 +43,15 @@ public partial class DesktopApp : Application
         _refresh.SnapshotChanged += snapshot => dispatcher.TryEnqueue(() =>
         {
             _summary?.Update(snapshot);
-            _tray?.SetTooltip(snapshot.Config.Plan + ": $" + snapshot.Cycle.CostUsd.ToString("F2"));
+            _tray?.SetTooltip(SnapshotPresentation.Tooltip(snapshot, _plans));
         });
         _refresh.Failed += error => dispatcher.TryEnqueue(() => _summary?.ShowError(error));
         _tray = new TrayHost();
         _tray.LeftButtonDown += _visibility.BeginTrayInteraction;
         _tray.LeftClicked += ToggleSummaryFromTray;
         _tray.RightClicked += ShowQuickActions;
+        var catalog = await _core.LoadSettingsAsync();
+        if (catalog.Ok && catalog.Data is not null) _plans = catalog.Data.Plans;
         await _refresh.StartAsync();
         if (showAfterLaunch) ShowSummary();
     }
@@ -78,7 +81,7 @@ public partial class DesktopApp : Application
     private async Task TransitionSummaryAsync(int generation, bool show)
     {
         if (_disposed) return;
-        _summary ??= new SummaryWindow(_refresh!, OnSummaryDeactivated, ShowSettings);
+        _summary ??= new SummaryWindow(_refresh!, _plans, OnSummaryDeactivated, ShowSettings);
         var completed = show
             ? await _summary.ShowAsync(_tray?.GetIconRect(), _uiSettings.AnimationsEnabled)
             : await _summary.HideAsync(_uiSettings.AnimationsEnabled);
@@ -155,6 +158,7 @@ internal sealed class SummaryWindow : Window
     private const int GapEpx = 12;
     private const int AnimationOffsetEpx = 10;
     private readonly RefreshCoordinator _refresh;
+    private readonly IReadOnlyList<PlanDto> _plans;
     private readonly Action _deactivated;
     private readonly Border _root = new() { Width = WidthEpx, Height = HeightEpx, CornerRadius = new CornerRadius(12) };
     private readonly TranslateTransform _translation = new();
@@ -162,6 +166,7 @@ internal sealed class SummaryWindow : Window
     private readonly TextBlock _tier = new();
     private readonly TextBlock _cost = new() { FontSize = 32, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold };
     private readonly ProgressBar _progress = new() { Minimum = 0, Maximum = 100, Height = 6 };
+    private readonly TextBlock _progressText = new() { FontSize = 12, Opacity = .72, VerticalAlignment = VerticalAlignment.Center };
     private readonly TextBlock _context = new() { Opacity = .72 };
     private readonly TextBlock _today = new() { FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold };
     private readonly TextBlock _days = new() { FontSize = 17, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold };
@@ -177,7 +182,8 @@ internal sealed class SummaryWindow : Window
         HorizontalAlignment = HorizontalAlignment.Left,
     };
     private readonly TextBlock _updated = new() { Opacity = .65, VerticalAlignment = VerticalAlignment.Center };
-    private readonly InfoBar _error = new() { IsOpen = false, Severity = InfoBarSeverity.Error };
+    private readonly InfoBar _warning = new() { IsOpen = false, IsClosable = false, Severity = InfoBarSeverity.Warning };
+    private readonly InfoBar _error = new() { IsOpen = false, IsClosable = true, Severity = InfoBarSeverity.Error };
     private readonly ProgressRing _busy = new() { IsActive = false, Width = 20, Height = 20 };
     private AppWindow? _appWindow;
     private OverlappedPresenter? _presenter;
@@ -187,9 +193,10 @@ internal sealed class SummaryWindow : Window
     private FlyoutPoint _hideOffset;
     private bool _isShown;
 
-    public SummaryWindow(RefreshCoordinator refresh, Action deactivated, Action openSettings)
+    public SummaryWindow(RefreshCoordinator refresh, IReadOnlyList<PlanDto> plans, Action deactivated, Action openSettings)
     {
         _refresh = refresh;
+        _plans = plans;
         _deactivated = deactivated;
         Title = "Codex Savings";
         SystemBackdrop = new DesktopAcrylicBackdrop();
@@ -216,6 +223,7 @@ internal sealed class SummaryWindow : Window
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(settingsButton, "Settings");
         ToolTipService.SetToolTip(settingsButton, "Settings");
         settingsButton.Click += (_, _) => openSettings();
+        _error.ActionButton = new Button { Content = "Retry" }.Also(button => button.Click += async (_, _) => await RefreshAsync());
         _allTime.Click += async (_, _) =>
         {
             if (_refresh.LastSnapshot?.AllTime is null) await CalculateAllTimeAsync();
@@ -232,11 +240,18 @@ internal sealed class SummaryWindow : Window
         }});
         Grid.SetColumn(settingsButton, 2);
         header.Children.Add(settingsButton);
+        var progressRow = new Grid { ColumnSpacing = 8 };
+        progressRow.ColumnDefinitions.Add(new ColumnDefinition());
+        progressRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        progressRow.Children.Add(_progress);
+        Grid.SetColumn(_progressText, 1);
+        progressRow.Children.Add(_progressText);
+        var noticeArea = new Grid { Children = { _context, _warning, _error } };
         _root.RenderTransform = _translation;
         _root.Child = new StackPanel { Spacing = 9, Padding = new Thickness(20, 16, 20, 14), Children =
         {
             header,
-            _cost, _progress, _context, stats, _error,
+            _cost, progressRow, noticeArea, stats,
             new Grid { Children =
             {
                 _updated,
@@ -252,23 +267,26 @@ internal sealed class SummaryWindow : Window
     }
     public void Update(SnapshotDto snapshot)
     {
-        var planUsd = snapshot.Config.MonthlyUsdOverride ?? snapshot.Config.Plan switch
-        {
-            "go" => 8, "plus" => 20, "pro_5x" => 100, "pro_20x" => 200, "business" => 20, _ => 0,
-        };
-        _plan.Text = snapshot.Config.Plan.Replace('_', ' ');
+        var planUsd = SnapshotPresentation.PlanUsd(snapshot.Config, _plans);
+        _plan.Text = SnapshotPresentation.PlanName(snapshot.Config, _plans);
         _tier.Text = snapshot.ServiceTier;
         _cost.Text = "$" + snapshot.Cycle.CostUsd.ToString("F2");
         _progress.Visibility = planUsd > 0 ? Visibility.Visible : Visibility.Collapsed;
-        _progress.Value = planUsd > 0 ? Math.Min(100, snapshot.Cycle.CostUsd / planUsd * 100) : 0;
-        _context.Text = planUsd <= 0 ? "API-equivalent value this cycle" :
-            snapshot.Cycle.CostUsd >= planUsd
-                ? "$" + (snapshot.Cycle.CostUsd - planUsd).ToString("F2") + " saved beyond the plan price"
-                : "$" + (planUsd - snapshot.Cycle.CostUsd).ToString("F2") + " left to break even";
+        _progressText.Visibility = _progress.Visibility;
+        var percentage = planUsd > 0 ? snapshot.Cycle.CostUsd / planUsd * 100 : 0;
+        _progress.Value = Math.Min(100, percentage);
+        _progressText.Text = percentage.ToString("F0") + "%";
+        _context.Text = SnapshotPresentation.Context(snapshot, _plans);
         _today.Text = "$" + snapshot.Today.CostUsd.ToString("F2");
         _days.Text = snapshot.DaysUntilReset.ToString();
         _allTime.Content = snapshot.AllTime is null ? "Calculate" : "$" + snapshot.AllTime.CostUsd.ToString("F2");
         _updated.Text = "Updated " + snapshot.UpdatedAt;
+        _error.IsOpen = false;
+        var warning = SnapshotPresentation.Warning(snapshot);
+        _warning.Title = SnapshotPresentation.UsesSpanish(snapshot.Config) ? "Revisar estimacion" : "Review estimate";
+        _warning.Message = warning ?? string.Empty;
+        _warning.IsOpen = warning is not null;
+        _context.Visibility = warning is null ? Visibility.Visible : Visibility.Collapsed;
     }
     private static Border Chip(TextBlock text) => new()
     {
@@ -410,7 +428,14 @@ internal sealed class SummaryWindow : Window
         Storyboard.SetTargetProperty(animation, property);
         return animation;
     }
-    public void ShowError(CoreError error) { _error.Title = error.Code; _error.Message = error.Message; _error.IsOpen = true; }
+    public void ShowError(CoreError error)
+    {
+        _warning.IsOpen = false;
+        _context.Visibility = Visibility.Collapsed;
+        _error.Title = error.Code;
+        _error.Message = error.Message;
+        _error.IsOpen = true;
+    }
     private async Task RefreshAsync() { _busy.IsActive = true; await _refresh.RefreshAsync(); _busy.IsActive = false; }
     private async Task CalculateAllTimeAsync() { _busy.IsActive = true; await _refresh.CalculateAllTimeAsync(); _busy.IsActive = false; }
 }
