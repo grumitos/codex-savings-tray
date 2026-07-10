@@ -8,6 +8,8 @@
   <ItemGroup>
     <Compile Include="..\CodexSavings.App\CoreBridge.cs" Link="CoreBridge.cs" />
     <Compile Include="..\CodexSavings.App\FlyoutVisibilityController.cs" Link="FlyoutVisibilityController.cs" />
+    <Compile Include="..\CodexSavings.App\FlyoutPlacement.cs" Link="FlyoutPlacement.cs" />
+    <Compile Include="..\CodexSavings.App\RefreshCoordinator.cs" Link="RefreshCoordinator.cs" />
     <Compile Include="..\CodexSavings.App\SettingsValidator.cs" Link="SettingsValidator.cs" />
   </ItemGroup>
 </Project>
