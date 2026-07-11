@@ -341,6 +341,7 @@ internal sealed class SummaryWindow : Window
         _presenter!.IsAlwaysOnTop = true;
         _isShown = true;
         Activate();
+        FlyoutWindowNative.Apply(_windowHandle);
 
         if (!animationsEnabled)
         {
@@ -521,6 +522,7 @@ internal sealed class QuickActionsWindow : Window
         FlyoutWindowNative.Apply(window);
         FlyoutWindowNative.Place(appWindow, window, iconRect, WidthEpx, HeightEpx, 12, 0);
         Activate();
+        FlyoutWindowNative.Apply(window);
         _firstButton.Focus(FocusState.Programmatic);
     }
 
