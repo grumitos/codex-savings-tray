@@ -1,5 +1,7 @@
 # Codex Savings Tray
 
+> **Status:** early-stage and under active development. Version `0.2.1` has a functional Windows build, automated Rust tests, and a documented release workflow.
+
 Tiny Windows tray app that estimates the API-equivalent value of local Codex
 usage and compares the month-to-date total with your selected ChatGPT/Codex
 plan.
